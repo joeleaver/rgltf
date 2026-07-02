@@ -117,6 +117,26 @@ pub struct Material {
     pub normal_tex: Option<TexRef>,
     pub occlusion_tex: Option<TexRef>,
     pub emissive_tex: Option<TexRef>,
+
+    // KHR_materials_ior — index of refraction (default 1.5 → dielectric F0 = 0.04).
+    pub ior: f32,
+    // KHR_materials_specular — scales/tints the dielectric specular (F0 + weight).
+    pub specular_factor: f32,
+    pub specular_color_factor: [f32; 3],
+    pub specular_tex: Option<TexRef>,       // A = specular factor
+    pub specular_color_tex: Option<TexRef>, // RGB = specular colour (sRGB)
+    // KHR_materials_clearcoat — a second clear-lacquer specular lobe.
+    pub clearcoat_factor: f32,
+    pub clearcoat_roughness_factor: f32,
+    pub clearcoat_normal_scale: f32,
+    pub clearcoat_tex: Option<TexRef>,           // R = clearcoat strength
+    pub clearcoat_roughness_tex: Option<TexRef>, // G = clearcoat roughness
+    pub clearcoat_normal_tex: Option<TexRef>,
+    // KHR_materials_sheen — retroreflective sheen lobe (cloth).
+    pub sheen_color_factor: [f32; 3],
+    pub sheen_roughness_factor: f32,
+    pub sheen_color_tex: Option<TexRef>,     // RGB = sheen colour (sRGB)
+    pub sheen_roughness_tex: Option<TexRef>, // A = sheen roughness
 }
 
 impl Default for Material {
@@ -139,6 +159,21 @@ impl Default for Material {
             normal_tex: None,
             occlusion_tex: None,
             emissive_tex: None,
+            ior: 1.5,
+            specular_factor: 1.0,
+            specular_color_factor: [1.0, 1.0, 1.0],
+            specular_tex: None,
+            specular_color_tex: None,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            clearcoat_normal_scale: 1.0,
+            clearcoat_tex: None,
+            clearcoat_roughness_tex: None,
+            clearcoat_normal_tex: None,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            sheen_roughness_factor: 0.0,
+            sheen_color_tex: None,
+            sheen_roughness_tex: None,
         }
     }
 }
@@ -749,6 +784,32 @@ fn apply_uv_transform(uvs: &[[f32; 2]], offset: [f32; 2], rotation: f32, scale: 
         .collect()
 }
 
+/// A scalar field of a raw extension JSON object, with a default.
+fn jf32(o: &serde_json::Value, key: &str, default: f32) -> f32 {
+    o.get(key).and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(default)
+}
+
+/// A 3-vector field of a raw extension JSON object, with a default.
+fn jvec3(o: &serde_json::Value, key: &str, default: [f32; 3]) -> [f32; 3] {
+    match o.get(key).and_then(|v| v.as_array()) {
+        Some(a) if a.len() >= 3 => [
+            a[0].as_f64().map(|x| x as f32).unwrap_or(default[0]),
+            a[1].as_f64().map(|x| x as f32).unwrap_or(default[1]),
+            a[2].as_f64().map(|x| x as f32).unwrap_or(default[2]),
+        ],
+        _ => default,
+    }
+}
+
+/// A `textureInfo` field of a raw extension JSON object → resolved [`TexRef`]. `t` is
+/// the JSON value of the texture-info object itself (e.g. `ext.get("clearcoatTexture")`).
+fn jtex(t: Option<&serde_json::Value>, img_of: impl Fn(usize) -> usize) -> Option<TexRef> {
+    let t = t?;
+    let index = t.get("index")?.as_u64()? as usize;
+    let texcoord = t.get("texCoord").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    Some(TexRef { image: img_of(index), texcoord })
+}
+
 fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
     let pbr = m.pbr_metallic_roughness();
     // Resolve a texture index → image index (KHR_texture_basisu-aware). Never call
@@ -758,6 +819,30 @@ fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
         image: img_of(info.texture().index()),
         texcoord: info.tex_coord(),
     };
+
+    // KHR_materials_specular (typed accessor).
+    let spec = m.specular();
+    let specular_factor = spec.as_ref().map_or(1.0, |s| s.specular_factor());
+    let specular_color_factor = spec.as_ref().map_or([1.0, 1.0, 1.0], |s| s.specular_color_factor());
+    let specular_tex = spec.as_ref().and_then(|s| s.specular_texture()).map(tref);
+    let specular_color_tex = spec.as_ref().and_then(|s| s.specular_color_texture()).map(tref);
+
+    // KHR_materials_clearcoat / _sheen — raw JSON (no typed accessors in this gltf version).
+    let cc = m.extension_value("KHR_materials_clearcoat");
+    let clearcoat_factor = cc.map_or(0.0, |v| jf32(v, "clearcoatFactor", 0.0));
+    let clearcoat_roughness_factor = cc.map_or(0.0, |v| jf32(v, "clearcoatRoughnessFactor", 0.0));
+    let clearcoat_tex = cc.and_then(|v| jtex(v.get("clearcoatTexture"), img_of));
+    let clearcoat_roughness_tex = cc.and_then(|v| jtex(v.get("clearcoatRoughnessTexture"), img_of));
+    let clearcoat_normal_tex = cc.and_then(|v| jtex(v.get("clearcoatNormalTexture"), img_of));
+    let clearcoat_normal_scale =
+        cc.and_then(|v| v.get("clearcoatNormalTexture")).map_or(1.0, |t| jf32(t, "scale", 1.0));
+
+    let sh = m.extension_value("KHR_materials_sheen");
+    let sheen_color_factor = sh.map_or([0.0, 0.0, 0.0], |v| jvec3(v, "sheenColorFactor", [0.0, 0.0, 0.0]));
+    let sheen_roughness_factor = sh.map_or(0.0, |v| jf32(v, "sheenRoughnessFactor", 0.0));
+    let sheen_color_tex = sh.and_then(|v| jtex(v.get("sheenColorTexture"), img_of));
+    let sheen_roughness_tex = sh.and_then(|v| jtex(v.get("sheenRoughnessTexture"), img_of));
+
     Material {
         name: m.name().unwrap_or("material").to_string(),
         base_color_factor: pbr.base_color_factor(),
@@ -786,6 +871,21 @@ fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
             texcoord: t.tex_coord(),
         }),
         emissive_tex: m.emissive_texture().map(tref),
+        ior: m.ior().unwrap_or(1.5),
+        specular_factor,
+        specular_color_factor,
+        specular_tex,
+        specular_color_tex,
+        clearcoat_factor,
+        clearcoat_roughness_factor,
+        clearcoat_normal_scale,
+        clearcoat_tex,
+        clearcoat_roughness_tex,
+        clearcoat_normal_tex,
+        sheen_color_factor,
+        sheen_roughness_factor,
+        sheen_color_tex,
+        sheen_roughness_tex,
     }
 }
 
@@ -793,7 +893,12 @@ fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
 fn srgb_usage(materials: &[Material], image_count: usize) -> Vec<bool> {
     let mut srgb = vec![false; image_count];
     for m in materials {
-        for t in [m.base_color_tex, m.emissive_tex].into_iter().flatten() {
+        // Base-colour, emissive, and the specular/sheen *colour* textures are sRGB;
+        // everything else (normal/MR/occlusion/clearcoat/roughness) stays linear.
+        for t in [m.base_color_tex, m.emissive_tex, m.specular_color_tex, m.sheen_color_tex]
+            .into_iter()
+            .flatten()
+        {
             if t.image < srgb.len() {
                 srgb[t.image] = true;
             }

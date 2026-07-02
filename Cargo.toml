@@ -31,9 +31,14 @@ glam = "0.29"
 gltf = { version = "1", features = [
     "KHR_materials_emissive_strength",
     "KHR_materials_unlit",
+    "KHR_materials_ior",
+    "KHR_materials_specular",
     "KHR_lights_punctual",
     "KHR_texture_transform",
     "KHR_materials_variants",
+    # Generic raw-extension access (material.extension_value) for clearcoat/sheen,
+    # which this gltf version has no typed accessors for.
+    "extensions",
     "extras",
     "names",
 ] }

@@ -23,6 +23,13 @@ struct Material {
     params: vec4<f32>,     // metallic, roughness, normal_scale, occlusion_strength
     flags: vec4<f32>,      // has: base, metallic_roughness, normal, occlusion
     flags2: vec4<f32>,     // has_emissive, alpha_cutoff, alpha_mode(0 opaque,1 mask,2 blend), unlit
+    // Extensions:
+    specular: vec4<f32>,       // KHR_materials_specular factor, KHR_materials_ior, _, _
+    specular_color: vec4<f32>, // specular colour factor rgb, _
+    clearcoat: vec4<f32>,      // KHR_materials_clearcoat factor, roughness, normal_scale, _
+    sheen: vec4<f32>,          // KHR_materials_sheen colour rgb, w = roughness
+    ext_flags: vec4<f32>,      // has: specular, specular_color, clearcoat, clearcoat_roughness
+    ext_flags2: vec4<f32>,     // has: clearcoat_normal, sheen_color, sheen_roughness, _
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -34,6 +41,13 @@ struct Material {
 @group(1) @binding(4) var t_occlusion: texture_2d<f32>;
 @group(1) @binding(5) var t_emissive: texture_2d<f32>;
 @group(1) @binding(6) var samp: sampler;
+@group(1) @binding(7) var t_specular: texture_2d<f32>;
+@group(1) @binding(8) var t_specular_color: texture_2d<f32>;
+@group(1) @binding(9) var t_clearcoat: texture_2d<f32>;
+@group(1) @binding(10) var t_clearcoat_rough: texture_2d<f32>;
+@group(1) @binding(11) var t_clearcoat_normal: texture_2d<f32>;
+@group(1) @binding(12) var t_sheen_color: texture_2d<f32>;
+@group(1) @binding(13) var t_sheen_rough: texture_2d<f32>;
 
 // Skinning: the joint-matrix palette (all skins concatenated; each draw's slice starts
 // at its per-instance `skin.y` base). Already world-space (world[joint]·inverseBind).
@@ -129,6 +143,24 @@ fn f_schlick_rough(cos_t: f32, f0: vec3<f32>, rough: f32) -> vec3<f32> {
     return f0 + (fmax - f0) * pow(clamp(1.0 - cos_t, 0.0, 1.0), 5.0);
 }
 
+// Scalar Schlick for the clearcoat coat (fixed F0 = 0.04, IOR 1.5 lacquer).
+fn f_schlick_scalar(cos_t: f32, f0: f32) -> f32 {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_t, 0.0, 1.0), 5.0);
+}
+
+// KHR_materials_sheen: the "Charlie" sheen NDF + Ashikhmin visibility (retroreflective
+// cloth lobe).
+fn d_charlie(n_dot_h: f32, rough: f32) -> f32 {
+    let a = max(rough, 0.07);
+    let inv = 1.0 / a;
+    let sin2 = max(1.0 - n_dot_h * n_dot_h, 0.0);
+    return (2.0 + inv) * pow(sin2, inv * 0.5) / (2.0 * PI);
+}
+
+fn v_ashikhmin(n_dot_l: f32, n_dot_v: f32) -> f32 {
+    return 1.0 / max(4.0 * (n_dot_l + n_dot_v - n_dot_l * n_dot_v), 1e-4);
+}
+
 fn aces(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -198,7 +230,25 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     }
 
     let albedo = base.rgb;
-    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+
+    // KHR_materials_ior + KHR_materials_specular: dielectric F0 from the IOR, tinted by
+    // the specular colour; the specular weight scales the whole dielectric specular lobe
+    // (applied to both direct + IBL below — metals are unaffected). Defaults (ior 1.5,
+    // colour 1, weight 1) reproduce plain F0 = 0.04.
+    let ior = mat.specular.y;
+    let f0_ior = pow((ior - 1.0) / (ior + 1.0), 2.0);
+    var spec_color = mat.specular_color.rgb;
+    if (mat.ext_flags.y > 0.5 && use_tex) {
+        spec_color = spec_color * textureSample(t_specular_color, samp, in.uv).rgb;
+    }
+    var spec_weight = mat.specular.x;
+    if (mat.ext_flags.x > 0.5 && use_tex) {
+        spec_weight = spec_weight * textureSample(t_specular, samp, in.uv).a;
+    }
+    let dielectric_f0 = min(vec3<f32>(f0_ior) * spec_color, vec3<f32>(1.0));
+    let f0 = mix(dielectric_f0, albedo, metallic);
+    // Weight applied to the specular lobe: dielectrics scaled by spec_weight, metals by 1.
+    let spec_lobe_weight = mix(spec_weight, 1.0, metallic);
     let diffuse_color = albedo * (1.0 - metallic);
 
     let v = normalize(frame.cam_pos.xyz - in.world_pos);
@@ -216,7 +266,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             let d = d_ggx(n_dot_h, rough);
             let vis = v_smith_ggx(n_dot_v, n_dot_l, rough);
             let f = f_schlick(v_dot_h, f0);
-            let spec = d * vis * f / max(4.0 * n_dot_v * n_dot_l, 1e-5);
+            // KHR_materials_specular weight scales the whole dielectric specular lobe.
+            let spec = d * vis * f / max(4.0 * n_dot_v * n_dot_l, 1e-5) * spec_lobe_weight;
             let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
             lo = (kd * diffuse_color / PI + spec) * frame.light_color.rgb * n_dot_l;
         }
@@ -232,16 +283,91 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let max_mip = max(frame.flags.y - 1.0, 0.0);
     let prefiltered = textureSampleLevel(pre_cube, cube_samp, refl, rough * max_mip).rgb;
     let env_brdf = textureSample(brdf_lut, lut_samp, vec2<f32>(n_dot_v, rough)).rg;
-    let specular_ibl = prefiltered * (f0 * env_brdf.x + env_brdf.y);
+    // KHR_materials_specular weight also scales the env specular (metals keep 1).
+    let specular_ibl = prefiltered * (f0 * env_brdf.x + env_brdf.y) * spec_lobe_weight;
     let ambient = (kd * diffuse_ibl + specular_ibl) * ao * frame.flags.z;
 
-    // Emissive.
+    // Base material lit result (direct key light + IBL). Sheen and clearcoat layer over it.
+    var lit = lo + ambient;
+
+    // ── KHR_materials_sheen: a retroreflective cloth lobe added over the base. Gated on
+    // the (uniform) sheen colour/flag so textureSample stays in uniform control flow.
+    if (max(mat.sheen.r, max(mat.sheen.g, mat.sheen.b)) > 0.0 || mat.ext_flags2.y > 0.5) {
+        var sheen_color = mat.sheen.rgb;
+        if (mat.ext_flags2.y > 0.5 && use_tex) {
+            sheen_color = sheen_color * textureSample(t_sheen_color, samp, in.uv).rgb;
+        }
+        var sheen_rough = mat.sheen.w;
+        if (mat.ext_flags2.z > 0.5 && use_tex) {
+            sheen_rough = sheen_rough * textureSample(t_sheen_rough, samp, in.uv).a;
+        }
+        sheen_rough = clamp(sheen_rough, 0.07, 1.0);
+        let l = normalize(frame.light_dir.xyz);
+        let h = normalize(v + l);
+        let ndl = max(dot(n, l), 0.0);
+        var sheen = vec3<f32>(0.0);
+        if (ndl > 0.0) {
+            let ndh = max(dot(n, h), 0.0);
+            sheen = sheen_color * d_charlie(ndh, sheen_rough) * v_ashikhmin(ndl, n_dot_v)
+                  * frame.light_color.rgb * ndl;
+        }
+        // Cheap IBL sheen: the prefiltered environment tinted by the sheen colour.
+        let sheen_env = textureSampleLevel(pre_cube, cube_samp, refl, sheen_rough * max_mip).rgb;
+        lit = lit + sheen + sheen_color * sheen_env * ao * frame.flags.z;
+    }
+
+    // ── KHR_materials_clearcoat: a clear-lacquer specular layer over everything (base +
+    // sheen). Its reflectance attenuates the layers beneath. Gated on the uniform factor.
+    if (mat.clearcoat.x > 0.0) {
+        var cc = mat.clearcoat.x;
+        if (mat.ext_flags.z > 0.5 && use_tex) {
+            cc = cc * textureSample(t_clearcoat, samp, in.uv).r;
+        }
+        var cc_rough = mat.clearcoat.y;
+        if (mat.ext_flags.w > 0.5 && use_tex) {
+            cc_rough = cc_rough * textureSample(t_clearcoat_rough, samp, in.uv).g;
+        }
+        cc_rough = clamp(cc_rough, 0.04, 1.0);
+        // The coat has its own normal (its map, else the geometric normal — the coat is
+        // smooth over the geometry and ignores the base normal map).
+        var cc_n = ng;
+        if (mat.ext_flags2.x > 0.5 && use_tex) {
+            let ts = textureSample(t_clearcoat_normal, samp, in.uv).xyz * 2.0 - 1.0;
+            let scaled = vec3<f32>(ts.xy * mat.clearcoat.z, ts.z);
+            let t = normalize(in.tangent - ng * dot(ng, in.tangent));
+            let b = normalize(in.bitangent);
+            cc_n = normalize(mat3x3<f32>(t, b, ng) * scaled);
+        }
+        let cc_ndv = max(dot(cc_n, v), 1e-4);
+        let l = normalize(frame.light_dir.xyz);
+        let h = normalize(v + l);
+        let cc_ndl = max(dot(cc_n, l), 0.0);
+        var cc_direct = vec3<f32>(0.0);
+        if (cc_ndl > 0.0) {
+            let cc_ndh = max(dot(cc_n, h), 0.0);
+            let cc_vdh = max(dot(v, h), 0.0);
+            let dcc = d_ggx(cc_ndh, cc_rough);
+            let vcc = v_smith_ggx(cc_ndv, cc_ndl, cc_rough);
+            let fcc = f_schlick_scalar(cc_vdh, 0.04);
+            cc_direct = vec3<f32>(dcc * vcc * fcc / max(4.0 * cc_ndv * cc_ndl, 1e-5))
+                      * frame.light_color.rgb * cc_ndl;
+        }
+        // Coat IBL reflection (F0 = 0.04).
+        let cc_refl = reflect(-v, cc_n);
+        let cc_env = textureSampleLevel(pre_cube, cube_samp, cc_refl, cc_rough * max_mip).rgb;
+        let cc_ibl = cc_env * f_schlick_scalar(cc_ndv, 0.04) * ao * frame.flags.z;
+        // Attenuate the layers beneath by the coat's reflectance at its own view angle.
+        let cc_atten = cc * f_schlick_scalar(cc_ndv, 0.04);
+        lit = lit * (1.0 - cc_atten) + cc * (cc_direct + cc_ibl);
+    }
+
+    // Emissive (over the coat — emitters aren't dimmed by the clearcoat).
     var emissive = mat.emissive.rgb * mat.emissive.w;
     if (mat.flags2.x > 0.5 && use_tex) {
         emissive = emissive * textureSample(t_emissive, samp, in.uv).rgb;
     }
 
-    let color = lo + ambient + emissive;
+    let color = lit + emissive;
     return vec4<f32>(to_srgb(aces(color)), base.a);
 }
 

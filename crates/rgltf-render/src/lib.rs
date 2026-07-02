@@ -47,6 +47,13 @@ struct MaterialUniform {
     params: [f32; 4],   // metallic, roughness, normal_scale, occlusion_strength
     flags: [f32; 4],    // has: base, mr, normal, occlusion
     flags2: [f32; 4],   // has_emissive, alpha_cutoff, alpha_mode, unlit
+    // Material extensions:
+    specular: [f32; 4],       // specular_factor, ior, _, _
+    specular_color: [f32; 4], // specular_color_factor rgb, _
+    clearcoat: [f32; 4],      // factor, roughness, normal_scale, _
+    sheen: [f32; 4],          // sheen_color_factor rgb, w = sheen_roughness
+    ext_flags: [f32; 4],      // has: specular, specular_color, clearcoat, clearcoat_roughness
+    ext_flags2: [f32; 4],     // has: clearcoat_normal, sheen_color, sheen_roughness, _
 }
 
 struct GpuMaterial {
@@ -275,6 +282,16 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Material extensions: specular(7), specular_color(8), clearcoat(9),
+                // clearcoat_roughness(10), clearcoat_normal(11), sheen_color(12),
+                // sheen_roughness(13). (12 sampled textures total, under the 16 limit.)
+                tex_entry(7),
+                tex_entry(8),
+                tex_entry(9),
+                tex_entry(10),
+                tex_entry(11),
+                tex_entry(12),
+                tex_entry(13),
             ],
         });
 
@@ -583,6 +600,22 @@ impl Renderer {
                 },
                 f(m.unlit),
             ],
+            specular: [m.specular_factor, m.ior, 0.0, 0.0],
+            specular_color: [m.specular_color_factor[0], m.specular_color_factor[1], m.specular_color_factor[2], 0.0],
+            clearcoat: [m.clearcoat_factor, m.clearcoat_roughness_factor, m.clearcoat_normal_scale, 0.0],
+            sheen: [m.sheen_color_factor[0], m.sheen_color_factor[1], m.sheen_color_factor[2], m.sheen_roughness_factor],
+            ext_flags: [
+                f(m.specular_tex.is_some()),
+                f(m.specular_color_tex.is_some()),
+                f(m.clearcoat_tex.is_some()),
+                f(m.clearcoat_roughness_tex.is_some()),
+            ],
+            ext_flags2: [
+                f(m.clearcoat_normal_tex.is_some()),
+                f(m.sheen_color_tex.is_some()),
+                f(m.sheen_roughness_tex.is_some()),
+                0.0,
+            ],
         }
     }
 
@@ -622,6 +655,13 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view_for(&m.occlusion_tex)) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(view_for(&m.emissive_tex)) },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(view_for(&m.specular_tex)) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(view_for(&m.specular_color_tex)) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(view_for(&m.clearcoat_tex)) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(view_for(&m.clearcoat_roughness_tex)) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(view_for(&m.clearcoat_normal_tex)) },
+                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(view_for(&m.sheen_color_tex)) },
+                    wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(view_for(&m.sheen_roughness_tex)) },
                 ],
             });
             gpu.materials.push(GpuMaterial { uniform, bind_group });
