@@ -35,15 +35,18 @@ impl Camera {
         }
     }
 
-    /// Near/far planes derived from the current distance and content radius.
+    /// Near/far planes derived from the current view distance and content radius.
     ///
-    /// `far` clears the far side of the content; `near` hugs the near side while
-    /// outside the content sphere, and shrinks proportionally to distance once the
-    /// camera dollies inside it — so zooming in never clips the model.
+    /// `near` is a small fraction of the view distance rather than hugging the
+    /// rest-pose content sphere — animation (and multi-object scenes) can move
+    /// geometry closer to the eye than `distance - radius`, which would otherwise
+    /// near-clip it. `far` is generous for the same reason. `Depth32Float` has ample
+    /// precision for the resulting ratio, and shrinking `near` with `distance` means
+    /// zooming/dollying in never clips.
     fn clip_planes(&self) -> (f32, f32) {
         let r = self.radius.max(1e-4);
-        let far = (self.distance + r * 2.0).max(r * 1e-2);
-        let near = (self.distance - r).max(self.distance * 0.01).max(far * 1e-4);
+        let far = (self.distance + r * 3.0).max(r * 1e-2);
+        let near = (self.distance * 0.02).clamp(far * 1e-4, far * 0.5);
         (near, far.max(near * 1.0001))
     }
 

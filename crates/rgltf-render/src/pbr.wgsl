@@ -46,13 +46,27 @@ fn vs_main(
     @location(1) normal: vec3<f32>,
     @location(2) tangent: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    // Per-instance model matrix (columns) + normal matrix (columns; xyz used).
+    @location(4) m0: vec4<f32>,
+    @location(5) m1: vec4<f32>,
+    @location(6) m2: vec4<f32>,
+    @location(7) m3: vec4<f32>,
+    @location(8) n0: vec4<f32>,
+    @location(9) n1: vec4<f32>,
+    @location(10) n2: vec4<f32>,
 ) -> VsOut {
+    let model = mat4x4<f32>(m0, m1, m2, m3);
+    let normal_mat = mat3x3<f32>(n0.xyz, n1.xyz, n2.xyz);
+    let world = model * vec4<f32>(pos, 1.0);
+
     var out: VsOut;
-    out.clip_pos = frame.view_proj * vec4<f32>(pos, 1.0);
-    out.world_pos = pos;
-    out.normal = normal;
-    out.tangent = tangent.xyz;
-    out.bitangent = cross(normal, tangent.xyz) * tangent.w;
+    out.clip_pos = frame.view_proj * world;
+    out.world_pos = world.xyz;
+    let wn = normalize(normal_mat * normal);
+    let wt = normalize((model * vec4<f32>(tangent.xyz, 0.0)).xyz);
+    out.normal = wn;
+    out.tangent = wt;
+    out.bitangent = cross(wn, wt) * tangent.w;
     out.uv = uv;
     return out;
 }

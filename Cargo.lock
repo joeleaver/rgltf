@@ -3299,10 +3299,12 @@ dependencies = [
 name = "rgltf-app"
 version = "0.1.0"
 dependencies = [
+ "pollster",
  "rfd",
  "rgltf-asset",
  "rgltf-render",
  "rinch",
+ "winit",
 ]
 
 [[package]]

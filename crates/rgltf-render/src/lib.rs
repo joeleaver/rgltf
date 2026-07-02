@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Mat3, Mat4, Vec3};
 use rgltf_asset::{AlphaMode, ImageData, Material, TexFormat, TexRef};
 use wgpu::util::DeviceExt;
 
@@ -47,11 +47,44 @@ struct GpuMaterial {
     bind_group: wgpu::BindGroup,
 }
 
+/// Per-mesh-primitive GPU geometry (local space, uploaded once).
 struct GpuPrimitive {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
     material: usize,
+}
+
+/// One draw: a primitive instantiated by a scene node, with a slice into the shared
+/// instance buffer (`instance_count` = 1 for now; >1 once `EXT_mesh_gpu_instancing`
+/// lands). `node` indexes the per-frame world-matrix array passed to [`Renderer::render`].
+struct Draw {
+    prim: usize,
+    node: usize,
+    instance_base: u32,
+    instance_count: u32,
+}
+
+/// Per-instance transform fed to the vertex shader (model + normal matrix).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],  // columns → shader locations 4..7
+    normal: [[f32; 4]; 3], // normal-matrix columns (xyz) → locations 8..10
+}
+
+impl InstanceRaw {
+    fn from_model(model: Mat4) -> Self {
+        let n = Mat3::from_mat4(model).inverse().transpose().to_cols_array();
+        InstanceRaw {
+            model: model.to_cols_array_2d(),
+            normal: [
+                [n[0], n[1], n[2], 0.0],
+                [n[3], n[4], n[5], 0.0],
+                [n[6], n[7], n[8], 0.0],
+            ],
+        }
+    }
 }
 
 /// Everything uploaded for the current scene (dropped/replaced on `set_scene`).
@@ -61,7 +94,10 @@ struct GpuScene {
     textures: Vec<wgpu::Texture>,
     texture_views: Vec<wgpu::TextureView>,
     materials: Vec<GpuMaterial>,
-    primitives: Vec<GpuPrimitive>,
+    prims: Vec<GpuPrimitive>,
+    draws: Vec<Draw>,
+    instance_buffer: Option<wgpu::Buffer>,
+    instance_count: u32,
 }
 
 struct Targets {
@@ -234,6 +270,12 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
+        // Vertex buffer 0: per-vertex geometry. Buffer 1: per-instance model+normal.
+        let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2];
+        let instance_attrs = wgpu::vertex_attr_array![
+            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+            8 => Float32x4, 9 => Float32x4, 10 => Float32x4
+        ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("rgltf-pipeline"),
             layout: Some(&layout),
@@ -241,13 +283,18 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<rgltf_asset::Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2
-                    ],
-                }],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<rgltf_asset::Vertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attrs,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &instance_attrs,
+                    },
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -384,7 +431,9 @@ impl Renderer {
         }
     }
 
-    /// Upload a scene: textures, per-material bind groups, per-primitive buffers.
+    /// Upload a scene: textures, per-material bind groups, per-mesh-primitive geometry,
+    /// and a draw list (one draw per node-instantiated primitive). Per-draw model
+    /// matrices are written into a shared instance buffer each frame in [`Self::render`].
     pub fn set_scene(&mut self, scene: &Scene) {
         let mut gpu = GpuScene::default();
 
@@ -423,32 +472,63 @@ impl Renderer {
             gpu.materials.push(GpuMaterial { uniform, bind_group });
         }
 
-        for prim in &scene.primitives {
-            if prim.vertices.is_empty() || prim.indices.is_empty() {
-                continue;
+        // Upload each mesh's primitives once; record their global prim indices.
+        let mut mesh_prims: Vec<Vec<usize>> = Vec::with_capacity(scene.meshes.len());
+        for mesh in &scene.meshes {
+            let mut ids = Vec::new();
+            for prim in &mesh.primitives {
+                if prim.vertices.is_empty() || prim.indices.is_empty() {
+                    continue;
+                }
+                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rgltf-prim-vbuf"),
+                    contents: bytemuck::cast_slice(&prim.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rgltf-prim-ibuf"),
+                    contents: bytemuck::cast_slice(&prim.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                ids.push(gpu.prims.len());
+                gpu.prims.push(GpuPrimitive {
+                    vbuf,
+                    ibuf,
+                    index_count: prim.indices.len() as u32,
+                    material: prim.material.min(gpu.materials.len().saturating_sub(1)),
+                });
             }
-            let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rgltf-prim-vbuf"),
-                contents: bytemuck::cast_slice(&prim.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rgltf-prim-ibuf"),
-                contents: bytemuck::cast_slice(&prim.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            gpu.primitives.push(GpuPrimitive {
-                vbuf,
-                ibuf,
-                index_count: prim.indices.len() as u32,
-                material: prim.material.min(gpu.materials.len().saturating_sub(1)),
-            });
+            mesh_prims.push(ids);
+        }
+
+        // Draw list: one draw per (node, primitive), one instance each for now.
+        let mut instance_base = 0u32;
+        for (node_idx, node) in scene.nodes.iter().enumerate() {
+            let Some(mi) = node.mesh else { continue };
+            let Some(ids) = mesh_prims.get(mi) else { continue };
+            for &prim in ids {
+                gpu.draws.push(Draw { prim, node: node_idx, instance_base, instance_count: 1 });
+                instance_base += 1;
+            }
+        }
+        gpu.instance_count = instance_base;
+
+        if instance_base > 0 {
+            gpu.instance_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rgltf-instances"),
+                size: instance_base as u64 * std::mem::size_of::<InstanceRaw>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
         }
 
         self.scene = gpu;
     }
 
-    pub fn render(&mut self, camera: &Camera) {
+    /// Render one frame. `node_world` is the world matrix per scene node (indexed by
+    /// [`rgltf_asset::Scene`] node index) — evaluate `Scene::node_world_matrices` at the
+    /// current animation time and pass it here.
+    pub fn render(&mut self, camera: &Camera, node_world: &[Mat4]) {
         let eye = camera.eye();
         let frame = FrameUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
@@ -459,6 +539,19 @@ impl Renderer {
             ambient_ground: [self.ambient_ground[0], self.ambient_ground[1], self.ambient_ground[2], 1.0],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
+
+        // Per-draw model + normal matrices → shared instance buffer.
+        if let Some(inst_buf) = &self.scene.instance_buffer {
+            let mut instances: Vec<InstanceRaw> =
+                Vec::with_capacity(self.scene.instance_count as usize);
+            for draw in &self.scene.draws {
+                let model = node_world.get(draw.node).copied().unwrap_or(Mat4::IDENTITY);
+                // instance_count == 1 for now; multiply by per-instance transforms here
+                // once EXT_mesh_gpu_instancing is wired in.
+                instances.push(InstanceRaw::from_model(model));
+            }
+            self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
+        }
 
         let mut encoder = self
             .device
@@ -480,15 +573,22 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if !self.scene.primitives.is_empty() && !self.scene.materials.is_empty() {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.frame_bind_group, &[]);
-                for prim in &self.scene.primitives {
-                    let mat = &self.scene.materials[prim.material];
-                    pass.set_bind_group(1, &mat.bind_group, &[]);
-                    pass.set_vertex_buffer(0, prim.vbuf.slice(..));
-                    pass.set_index_buffer(prim.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..prim.index_count, 0, 0..1);
+            if let Some(inst_buf) = &self.scene.instance_buffer {
+                if !self.scene.draws.is_empty() && !self.scene.materials.is_empty() {
+                    let stride = std::mem::size_of::<InstanceRaw>() as u64;
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                    for draw in &self.scene.draws {
+                        let prim = &self.scene.prims[draw.prim];
+                        let mat = &self.scene.materials[prim.material];
+                        pass.set_bind_group(1, &mat.bind_group, &[]);
+                        pass.set_vertex_buffer(0, prim.vbuf.slice(..));
+                        let base = draw.instance_base as u64 * stride;
+                        let end = base + draw.instance_count as u64 * stride;
+                        pass.set_vertex_buffer(1, inst_buf.slice(base..end));
+                        pass.set_index_buffer(prim.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..prim.index_count, 0, 0..draw.instance_count);
+                    }
                 }
             }
         }

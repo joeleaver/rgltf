@@ -14,7 +14,7 @@
 //!
 //! Later phases add `KHR_texture_basisu` (KTX2/Basis), animation, and instancing.
 
-use glam::{Mat3, Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 
 // ── Bounds ────────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,8 @@ pub struct Vertex {
     pub uv: [f32; 2],
 }
 
-/// A drawable primitive: world-space geometry + an index into [`Scene::materials`].
+/// A drawable primitive: **local-space** geometry (node transforms are applied at
+/// draw time, not baked) + an index into [`Scene::materials`].
 #[derive(Debug)]
 pub struct Primitive {
     pub vertices: Vec<Vertex>,
@@ -175,32 +176,251 @@ pub struct ImageData {
     pub mips: Vec<MipLevel>,
 }
 
-// ── Scene ───────────────────────────────────────────────────────────────────
+// ── Scene graph ─────────────────────────────────────────────────────────────
+
+/// A mesh: a bundle of local-space primitives, instantiated by one or more nodes.
+#[derive(Debug)]
+pub struct Mesh {
+    pub primitives: Vec<Primitive>,
+}
+
+/// A scene-graph node. The local transform is stored decomposed (TRS) so animation
+/// channels can drive translation / rotation / scale independently.
+#[derive(Clone, Debug)]
+pub struct Node {
+    pub name: String,
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
+    pub mesh: Option<usize>,
+    pub depth: u32,
+}
+
+impl Node {
+    pub fn local_matrix(&self) -> Mat4 {
+        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    }
+    pub fn has_mesh(&self) -> bool {
+        self.mesh.is_some()
+    }
+}
+
+/// Keyframe interpolation mode of an animation sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interpolation {
+    Linear,
+    Step,
+    CubicSpline,
+}
+
+/// Which node property an animation channel drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimPath {
+    Translation,
+    Rotation,
+    Scale,
+    Weights,
+}
+
+/// Keyframe times (`input`) + flat output values. For `CubicSpline`, each keyframe's
+/// output is `[inTangent, value, outTangent]` (so 3× `components`); otherwise one
+/// `components`-tuple per keyframe.
+#[derive(Clone, Debug)]
+pub struct AnimSampler {
+    pub interpolation: Interpolation,
+    pub input: Vec<f32>,
+    pub output: Vec<f32>,
+    pub components: usize,
+}
+
+impl AnimSampler {
+    /// Values-per-keyframe stride in `output` (3× for cubic spline's tangents).
+    fn stride(&self) -> usize {
+        match self.interpolation {
+            Interpolation::CubicSpline => self.components * 3,
+            _ => self.components,
+        }
+    }
+
+    /// The `components` values of keyframe `k`. For cubic spline this is the *value*
+    /// slice (middle third), skipping the in/out tangents.
+    fn value(&self, k: usize) -> &[f32] {
+        let s = self.stride();
+        let base = k * s
+            + match self.interpolation {
+                Interpolation::CubicSpline => self.components, // skip inTangent
+                _ => 0,
+            };
+        &self.output[base..base + self.components]
+    }
+
+    /// Cubic-spline in/out tangents of keyframe `k`.
+    fn tangents(&self, k: usize) -> (&[f32], &[f32]) {
+        let s = self.stride();
+        let base = k * s;
+        let c = self.components;
+        (&self.output[base..base + c], &self.output[base + 2 * c..base + 3 * c])
+    }
+
+    /// Locate the keyframe interval bracketing `t`: `(i0, i1, frac, dt)`.
+    fn bracket(&self, t: f32) -> (usize, usize, f32, f32) {
+        let times = &self.input;
+        let last = times.len() - 1;
+        if t <= times[0] {
+            return (0, 0, 0.0, 0.0);
+        }
+        if t >= times[last] {
+            return (last, last, 0.0, 0.0);
+        }
+        let mut i = 0;
+        while i + 1 < times.len() && times[i + 1] <= t {
+            i += 1;
+        }
+        let (t0, t1) = (times[i], times[i + 1]);
+        let dt = t1 - t0;
+        let frac = if dt > 0.0 { (t - t0) / dt } else { 0.0 };
+        (i, i + 1, frac, dt)
+    }
+
+    /// Sample `components` scalars at time `t` (used for translation/scale/weights).
+    fn sample(&self, t: f32) -> Vec<f32> {
+        let c = self.components;
+        if self.input.is_empty() {
+            return vec![0.0; c];
+        }
+        let (i0, i1, f, dt) = self.bracket(t);
+        match self.interpolation {
+            Interpolation::Step => self.value(i0).to_vec(),
+            Interpolation::Linear => {
+                let a = self.value(i0);
+                let b = self.value(i1);
+                (0..c).map(|k| a[k] + (b[k] - a[k]) * f).collect()
+            }
+            Interpolation::CubicSpline => {
+                let v0 = self.value(i0).to_vec();
+                let v1 = self.value(i1).to_vec();
+                let (_, out0) = self.tangents(i0);
+                let (in1, _) = self.tangents(i1);
+                let (f2, f3) = (f * f, f * f * f);
+                let (h00, h10) = (2.0 * f3 - 3.0 * f2 + 1.0, f3 - 2.0 * f2 + f);
+                let (h01, h11) = (-2.0 * f3 + 3.0 * f2, f3 - f2);
+                (0..c)
+                    .map(|k| h00 * v0[k] + h10 * dt * out0[k] + h01 * v1[k] + h11 * dt * in1[k])
+                    .collect()
+            }
+        }
+    }
+
+    fn sample_vec3(&self, t: f32) -> Vec3 {
+        let v = self.sample(t);
+        Vec3::new(v[0], v[1], v[2])
+    }
+
+    /// Rotation sampling: slerp for `Linear` (per glTF spec), nearest key for `Step`,
+    /// normalized Hermite for `CubicSpline`.
+    fn sample_quat(&self, t: f32) -> Quat {
+        if self.input.is_empty() {
+            return Quat::IDENTITY;
+        }
+        let q = |k: usize| {
+            let v = self.value(k);
+            Quat::from_xyzw(v[0], v[1], v[2], v[3])
+        };
+        let (i0, i1, f, _dt) = self.bracket(t);
+        let result = match self.interpolation {
+            Interpolation::Step => q(i0),
+            Interpolation::Linear => q(i0).slerp(q(i1), f),
+            Interpolation::CubicSpline => {
+                let v = self.sample(t);
+                Quat::from_xyzw(v[0], v[1], v[2], v[3])
+            }
+        };
+        result.normalize()
+    }
+}
+
+/// One channel of an [`Animation`]: `sampler` drives `path` on `node`.
+#[derive(Clone, Debug)]
+pub struct AnimChannel {
+    pub node: usize,
+    pub path: AnimPath,
+    pub sampler: usize,
+}
 
 #[derive(Clone, Debug)]
-pub struct SceneNode {
+pub struct Animation {
     pub name: String,
-    pub depth: u32,
-    pub has_mesh: bool,
+    pub samplers: Vec<AnimSampler>,
+    pub channels: Vec<AnimChannel>,
+    pub duration: f32,
 }
 
 #[derive(Debug)]
 pub struct Scene {
     pub name: String,
-    pub primitives: Vec<Primitive>,
+    pub meshes: Vec<Mesh>,
     pub materials: Vec<Material>,
     pub images: Vec<ImageData>,
-    pub nodes: Vec<SceneNode>,
+    pub nodes: Vec<Node>,
+    pub roots: Vec<usize>,
+    pub animations: Vec<Animation>,
+    /// Rest-pose world-space bounds (for camera framing).
     pub bounds: Aabb,
     pub extensions_used: Vec<String>,
 }
 
 impl Scene {
     pub fn triangle_count(&self) -> usize {
-        self.primitives.iter().map(|p| p.indices.len() / 3).sum()
+        self.nodes
+            .iter()
+            .filter_map(|n| n.mesh)
+            .map(|m| self.meshes[m].primitives.iter().map(|p| p.indices.len() / 3).sum::<usize>())
+            .sum()
     }
     pub fn vertex_count(&self) -> usize {
-        self.primitives.iter().map(|p| p.vertices.len()).sum()
+        self.nodes
+            .iter()
+            .filter_map(|n| n.mesh)
+            .map(|m| self.meshes[m].primitives.iter().map(|p| p.vertices.len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Per-node local TRS at animation `time` (seconds): the rest pose with any
+    /// channels of animation `anim` applied on top.
+    pub fn local_transforms(&self, anim: Option<usize>, time: f32) -> Vec<(Vec3, Quat, Vec3)> {
+        let mut trs: Vec<(Vec3, Quat, Vec3)> =
+            self.nodes.iter().map(|n| (n.translation, n.rotation, n.scale)).collect();
+        if let Some(a) = anim.and_then(|i| self.animations.get(i)) {
+            for ch in &a.channels {
+                let s = &a.samplers[ch.sampler];
+                match ch.path {
+                    AnimPath::Translation => trs[ch.node].0 = s.sample_vec3(time),
+                    AnimPath::Rotation => trs[ch.node].1 = s.sample_quat(time),
+                    AnimPath::Scale => trs[ch.node].2 = s.sample_vec3(time),
+                    AnimPath::Weights => {} // morph targets — Phase 5d
+                }
+            }
+        }
+        trs
+    }
+
+    /// World matrix per node at animation `time`, walking the hierarchy from `roots`.
+    pub fn node_world_matrices(&self, anim: Option<usize>, time: f32) -> Vec<Mat4> {
+        let trs = self.local_transforms(anim, time);
+        let mut world = vec![Mat4::IDENTITY; self.nodes.len()];
+        let mut stack: Vec<(usize, Mat4)> =
+            self.roots.iter().rev().map(|&r| (r, Mat4::IDENTITY)).collect();
+        while let Some((n, parent)) = stack.pop() {
+            let (t, r, s) = trs[n];
+            let m = parent * Mat4::from_scale_rotation_translation(s, r, t);
+            world[n] = m;
+            for &c in &self.nodes[n].children {
+                stack.push((c, m));
+            }
+        }
+        world
     }
 
     /// A built-in unit cube (flat normals) shown before any file is loaded.
@@ -233,10 +453,21 @@ impl Scene {
         mat.roughness_factor = 0.55;
         Scene {
             name: "cube".into(),
-            primitives: vec![Primitive { vertices, indices, material: 0 }],
+            meshes: vec![Mesh { primitives: vec![Primitive { vertices, indices, material: 0 }] }],
             materials: vec![mat],
             images: Vec::new(),
-            nodes: vec![SceneNode { name: "cube".into(), depth: 0, has_mesh: true }],
+            nodes: vec![Node {
+                name: "cube".into(),
+                parent: None,
+                children: Vec::new(),
+                translation: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+                mesh: Some(0),
+                depth: 0,
+            }],
+            roots: vec![0],
+            animations: Vec::new(),
             bounds,
             extensions_used: Vec::new(),
         }
@@ -323,26 +554,43 @@ pub fn load(path: &std::path::Path) -> Result<Scene, LoadError> {
         doc.materials().map(|m| convert_material(m, &tex_to_image)).collect();
     materials.push(Material::default());
 
+    // Meshes: primitives kept in local space (node transforms applied at draw time).
+    let meshes: Vec<Mesh> = doc
+        .meshes()
+        .map(|m| Mesh {
+            primitives: m
+                .primitives()
+                .filter_map(|p| load_primitive(&p, &buffers, default_index))
+                .collect(),
+        })
+        .collect();
+
+    // Node hierarchy + the default scene's root nodes.
+    let nodes = build_nodes(doc);
+    let roots: Vec<usize> = doc
+        .default_scene()
+        .or_else(|| doc.scenes().next())
+        .map(|s| s.nodes().map(|n| n.index()).collect())
+        .unwrap_or_default();
+
+    let animations = parse_animations(doc, &buffers);
+
+    let srgb_flags = srgb_usage(&materials, doc.images().count());
+    let images = load_images(doc, base, &buffers, &srgb_flags)?;
+
     let mut scene = Scene {
         name,
-        primitives: Vec::new(),
+        meshes,
         materials,
-        images: Vec::new(),
-        nodes: Vec::new(),
+        images,
+        nodes,
+        roots,
+        animations,
         bounds: Aabb::empty(),
         extensions_used: doc.extensions_used().map(|s| s.to_string()).collect(),
     };
 
-    let gltf_scene = doc.default_scene().or_else(|| doc.scenes().next());
-    if let Some(gltf_scene) = gltf_scene {
-        for node in gltf_scene.nodes() {
-            visit_node(&node, Mat4::IDENTITY, 0, &buffers, default_index, &mut scene);
-        }
-    }
-
-    let srgb_flags = srgb_usage(&scene.materials, doc.images().count());
-    scene.images = load_images(doc, base, &buffers, &srgb_flags)?;
-
+    scene.bounds = compute_rest_bounds(&scene);
     if !scene.bounds.is_valid() {
         scene.bounds = Aabb { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) };
     }
@@ -425,47 +673,122 @@ fn srgb_usage(materials: &[Material], image_count: usize) -> Vec<bool> {
     srgb
 }
 
-fn visit_node(
-    node: &gltf::Node,
-    parent_world: Mat4,
-    depth: u32,
-    buffers: &[Vec<u8>],
-    default_material: usize,
-    scene: &mut Scene,
-) {
-    let local = Mat4::from_cols_array_2d(&node.transform().matrix());
-    let world = parent_world * local;
-
-    let name = node
-        .name()
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("node_{}", node.index()));
-    scene.nodes.push(SceneNode { name, depth, has_mesh: node.mesh().is_some() });
-
-    if let Some(mesh) = node.mesh() {
-        let normal_mat = Mat3::from_mat4(world).inverse().transpose();
-        let tangent_mat = Mat3::from_mat4(world);
-        for prim in mesh.primitives() {
-            if let Some(p) = load_primitive(&prim, world, normal_mat, tangent_mat, buffers, default_material)
-            {
-                for v in &p.vertices {
-                    scene.bounds.expand(Vec3::from_array(v.pos));
-                }
-                scene.primitives.push(p);
+/// Build the node hierarchy: decomposed TRS, parent/child links, and tree depth.
+fn build_nodes(doc: &gltf::Document) -> Vec<Node> {
+    let count = doc.nodes().count();
+    let mut nodes: Vec<Node> = doc
+        .nodes()
+        .map(|n| {
+            let (t, r, s) = n.transform().decomposed();
+            Node {
+                name: n
+                    .name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("node_{}", n.index())),
+                parent: None,
+                children: n.children().map(|c| c.index()).collect(),
+                translation: Vec3::from_array(t),
+                rotation: Quat::from_array(r),
+                scale: Vec3::from_array(s),
+                mesh: n.mesh().map(|m| m.index()),
+                depth: 0,
+            }
+        })
+        .collect();
+    for i in 0..count {
+        for c in nodes[i].children.clone() {
+            if let Some(child) = nodes.get_mut(c) {
+                child.parent = Some(i);
             }
         }
     }
-
-    for child in node.children() {
-        visit_node(&child, world, depth + 1, buffers, default_material, scene);
+    // Depth via a walk from parentless roots (glTF nodes form a forest).
+    let mut stack: Vec<(usize, u32)> =
+        (0..count).filter(|&i| nodes[i].parent.is_none()).map(|i| (i, 0)).collect();
+    while let Some((n, d)) = stack.pop() {
+        nodes[n].depth = d;
+        for c in nodes[n].children.clone() {
+            stack.push((c, d + 1));
+        }
     }
+    nodes
 }
 
+/// Rest-pose (default transforms) world-space AABB, for camera framing.
+fn compute_rest_bounds(scene: &Scene) -> Aabb {
+    let world = scene.node_world_matrices(None, 0.0);
+    let mut b = Aabb::empty();
+    for (i, node) in scene.nodes.iter().enumerate() {
+        let Some(mi) = node.mesh else { continue };
+        let m = world[i];
+        for prim in &scene.meshes[mi].primitives {
+            for v in &prim.vertices {
+                b.expand(m.transform_point3(Vec3::from_array(v.pos)));
+            }
+        }
+    }
+    b
+}
+
+/// Parse all glTF animations into keyframe samplers + channels.
+fn parse_animations(doc: &gltf::Document, buffers: &[Vec<u8>]) -> Vec<Animation> {
+    use gltf::animation::{Interpolation as GInterp, Property};
+    doc.animations()
+        .map(|a| {
+            let samplers: Vec<AnimSampler> = a
+                .samplers()
+                .map(|s| {
+                    let out = s.output();
+                    let components = match out.dimensions() {
+                        gltf::accessor::Dimensions::Scalar => 1,
+                        gltf::accessor::Dimensions::Vec2 => 2,
+                        gltf::accessor::Dimensions::Vec3 => 3,
+                        gltf::accessor::Dimensions::Vec4 => 4,
+                        _ => 4,
+                    };
+                    AnimSampler {
+                        interpolation: match s.interpolation() {
+                            GInterp::Linear => Interpolation::Linear,
+                            GInterp::Step => Interpolation::Step,
+                            GInterp::CubicSpline => Interpolation::CubicSpline,
+                        },
+                        input: read_attr(&s.input(), buffers, 1),
+                        output: read_attr(&out, buffers, components),
+                        components,
+                    }
+                })
+                .collect();
+            let channels: Vec<AnimChannel> = a
+                .channels()
+                .map(|c| AnimChannel {
+                    node: c.target().node().index(),
+                    path: match c.target().property() {
+                        Property::Translation => AnimPath::Translation,
+                        Property::Rotation => AnimPath::Rotation,
+                        Property::Scale => AnimPath::Scale,
+                        Property::MorphTargetWeights => AnimPath::Weights,
+                    },
+                    sampler: c.sampler().index(),
+                })
+                .collect();
+            let duration = samplers
+                .iter()
+                .map(|s| s.input.last().copied().unwrap_or(0.0))
+                .fold(0.0f32, f32::max);
+            Animation {
+                name: a.name().unwrap_or("animation").to_string(),
+                samplers,
+                channels,
+                duration,
+            }
+        })
+        .collect()
+}
+
+/// Load one primitive in **local (mesh) space**. Node transforms are applied at draw
+/// time, so no world/normal matrices are baked here.
 fn load_primitive(
     prim: &gltf::Primitive,
-    world: Mat4,
-    normal_mat: Mat3,
-    tangent_mat: Mat3,
     buffers: &[Vec<u8>],
     default_material: usize,
 ) -> Option<Primitive> {
@@ -476,16 +799,11 @@ fn load_primitive(
 
     // Positions (component-type aware → supports KHR_mesh_quantization).
     let pos_acc = prim.get(&Semantic::Positions)?;
-    let local_pos = read_vec3(&pos_acc, buffers);
-    if local_pos.is_empty() {
+    let positions = read_vec3(&pos_acc, buffers);
+    if positions.is_empty() {
         return None;
     }
-    let count = local_pos.len();
-
-    let positions: Vec<[f32; 3]> = local_pos
-        .iter()
-        .map(|p| world.transform_point3(Vec3::from_array(*p)).to_array())
-        .collect();
+    let count = positions.len();
 
     let indices: Vec<u32> = match prim.indices() {
         Some(acc) => read_indices(&acc, buffers),
@@ -495,7 +813,7 @@ fn load_primitive(
     let normals: Vec<[f32; 3]> = match prim.get(&Semantic::Normals) {
         Some(acc) => read_vec3(&acc, buffers)
             .iter()
-            .map(|n| (normal_mat * Vec3::from_array(*n)).normalize_or(Vec3::Y).to_array())
+            .map(|n| Vec3::from_array(*n).normalize_or(Vec3::Y).to_array())
             .collect(),
         None => compute_smooth_normals(&positions, &indices),
     };
@@ -515,7 +833,7 @@ fn load_primitive(
         Some(acc) => read_vec4(&acc, buffers)
             .iter()
             .map(|t| {
-                let v = (tangent_mat * Vec3::new(t[0], t[1], t[2])).normalize_or(Vec3::X);
+                let v = Vec3::new(t[0], t[1], t[2]).normalize_or(Vec3::X);
                 [v.x, v.y, v.z, if t[3] < 0.0 { -1.0 } else { 1.0 }]
             })
             .collect(),

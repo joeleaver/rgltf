@@ -9,9 +9,14 @@ name = "rgltf"
 path = "src/main.rs"
 
 [dependencies]
-# `gpu` = wgpu/Vello compositor + shared-device handoff; `debug` = the MCP bridge
-# (lets Claude screenshot/inspect the running viewer). `components`/`theme` for UI.
+# We own the winit loop + wgpu device (game-embed model); rinch is an embedded UI
+# overlay via `rinch::embed`. `gpu` = the embed/Vello renderer; `debug` = the MCP
+# bridge (screenshots/inspection); `components`/`theme` for the UI.
 rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme", "debug"] }
 rgltf-render = { workspace = true }
 rgltf-asset = { workspace = true }
 rfd = { workspace = true }
+# winit — same version rinch pins; the workspace [patch] redirects it to the fork so
+# window/event types unify with rinch's. pollster blocks on async device requests.
+winit = "0.31.0-beta.2"
+pollster = "0.4"
