@@ -13,11 +13,12 @@ repository = "https://github.com/joeleaver/rgltf"
 rgltf-render = { path = "crates/rgltf-render" }
 rgltf-asset = { path = "crates/rgltf-asset" }
 
-# rinch — path-depend on the local checkout so rgltf builds against the working
-# tree. rinch re-exports its own (patched) wgpu as `rinch::wgpu`; we depend on
-# `wgpu` directly too and rely on the [patch.crates-io] block below to unify the
-# two into a single crate instance (required for zero-copy texture handoff).
-rinch = { path = "/home/joe/dev/rinch/crates/rinch", default-features = false }
+# rinch — consumed from git, pinned to a specific commit for reproducibility. rinch
+# re-exports its own (patched) wgpu as `rinch::wgpu`; we depend on `wgpu` directly too
+# and rely on the [patch.crates-io] block below to unify the two into a single crate
+# instance (required for zero-copy texture handoff). To develop against a local rinch
+# checkout, add a `[patch."https://github.com/joeleaver/rinch"] rinch = { path = ... }`.
+rinch = { git = "https://github.com/joeleaver/rinch", rev = "b3c98b36d99123b92f94f682a591b6e85b85dc06", default-features = false }
 
 # Rendering / math. `wgpu = "27"` resolves to the rinch fork (v27.0.1) via the
 # patch below — same crate instance rinch links, so wgpu::Texture handed to
