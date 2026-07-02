@@ -31,6 +31,10 @@ struct Material {
 @group(1) @binding(5) var t_emissive: texture_2d<f32>;
 @group(1) @binding(6) var samp: sampler;
 
+// Skinning: the joint-matrix palette (all skins concatenated; each draw's slice starts
+// at its per-instance `skin.y` base). Already world-space (world[joint]·inverseBind).
+@group(2) @binding(0) var<storage, read> joint_matrices: array<mat4x4<f32>>;
+
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
@@ -46,6 +50,9 @@ fn vs_main(
     @location(1) normal: vec3<f32>,
     @location(2) tangent: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    // Per-vertex skin influences (JOINTS_0 as u32, WEIGHTS_0).
+    @location(11) joints: vec4<u32>,
+    @location(12) weights: vec4<f32>,
     // Per-instance model matrix (columns) + normal matrix (columns; xyz used).
     @location(4) m0: vec4<f32>,
     @location(5) m1: vec4<f32>,
@@ -54,9 +61,25 @@ fn vs_main(
     @location(8) n0: vec4<f32>,
     @location(9) n1: vec4<f32>,
     @location(10) n2: vec4<f32>,
+    // Per-instance skin selector: x = skinned flag, y = palette base offset.
+    @location(13) skin: vec4<u32>,
 ) -> VsOut {
-    let model = mat4x4<f32>(m0, m1, m2, m3);
-    let normal_mat = mat3x3<f32>(n0.xyz, n1.xyz, n2.xyz);
+    var model = mat4x4<f32>(m0, m1, m2, m3);
+    var normal_mat = mat3x3<f32>(n0.xyz, n1.xyz, n2.xyz);
+
+    // Skinned: replace the model transform with the weighted joint-palette blend. The
+    // joint matrices are already world-space, so the mesh node transform is ignored
+    // (per the glTF spec). Normals use the blend's 3x3 (rigid/near-uniform → inverse-
+    // transpose ≈ itself), which is standard practice for real-time skinning.
+    if (skin.x == 1u) {
+        let b = skin.y;
+        model = weights.x * joint_matrices[b + joints.x]
+              + weights.y * joint_matrices[b + joints.y]
+              + weights.z * joint_matrices[b + joints.z]
+              + weights.w * joint_matrices[b + joints.w];
+        normal_mat = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz);
+    }
+
     let world = model * vec4<f32>(pos, 1.0);
 
     var out: VsOut;

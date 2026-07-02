@@ -45,8 +45,11 @@ impl Aabb {
 
 // ── Vertex / geometry ─────────────────────────────────────────────────────────
 
-/// Interleaved PBR vertex (world space). `tangent.w` is the bitangent sign.
-/// `repr(C)` + `Pod` so the renderer can upload `&[Vertex]` directly.
+/// Interleaved PBR vertex (local space). `tangent.w` is the bitangent sign.
+/// `joints`/`weights` are the `JOINTS_0`/`WEIGHTS_0` skinning influences (all-zero
+/// for un-skinned geometry — the shader branches on the per-instance skin flag).
+/// `repr(C)` + `Pod` so the renderer can upload `&[Vertex]` directly (no padding:
+/// 12+12+16+8+8+16 = 72 bytes, 4-aligned).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -54,6 +57,8 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub tangent: [f32; 4],
     pub uv: [f32; 2],
+    pub joints: [u16; 4],
+    pub weights: [f32; 4],
 }
 
 /// A drawable primitive: **local-space** geometry (node transforms are applied at
@@ -195,6 +200,8 @@ pub struct Node {
     pub rotation: Quat,
     pub scale: Vec3,
     pub mesh: Option<usize>,
+    /// Index into [`Scene::skins`] when this node instantiates a *skinned* mesh.
+    pub skin: Option<usize>,
     pub depth: u32,
 }
 
@@ -205,6 +212,18 @@ impl Node {
     pub fn has_mesh(&self) -> bool {
         self.mesh.is_some()
     }
+}
+
+/// A skin: the joint nodes whose animated world transforms deform a skinned mesh,
+/// plus the per-joint inverse bind matrices (bind-pose mesh-space → joint-space).
+/// The joint matrix palette for the vertex shader is `world[joints[j]] · inverse_bind[j]`
+/// (the skinned mesh node's own transform is ignored, per the glTF spec).
+#[derive(Clone, Debug)]
+pub struct Skin {
+    pub joints: Vec<usize>,
+    pub inverse_bind: Vec<Mat4>,
+    /// The common-root node hint (`skin.skeleton`); unused for joint-matrix math.
+    pub skeleton: Option<usize>,
 }
 
 /// Keyframe interpolation mode of an animation sampler.
@@ -366,6 +385,7 @@ pub struct Scene {
     pub nodes: Vec<Node>,
     pub roots: Vec<usize>,
     pub animations: Vec<Animation>,
+    pub skins: Vec<Skin>,
     /// Rest-pose world-space bounds (for camera framing).
     pub bounds: Aabb,
     pub extensions_used: Vec<String>,
@@ -423,6 +443,20 @@ impl Scene {
         world
     }
 
+    /// Joint-matrix palette for `skin` given per-node world matrices: one matrix per
+    /// joint = `world[joint] · inverse_bind[joint]`, mapping bind-pose mesh-space
+    /// vertices to world space. Feed the result to the skinning vertex shader.
+    pub fn skin_palette(&self, skin: &Skin, world: &[Mat4]) -> Vec<Mat4> {
+        skin.joints
+            .iter()
+            .enumerate()
+            .map(|(j, &node)| {
+                let ibm = skin.inverse_bind.get(j).copied().unwrap_or(Mat4::IDENTITY);
+                world.get(node).copied().unwrap_or(Mat4::IDENTITY) * ibm
+            })
+            .collect()
+    }
+
     /// A built-in unit cube (flat normals) shown before any file is loaded.
     pub fn demo_cube() -> Self {
         let faces: [([f32; 3], [f32; 4], [[f32; 3]; 4]); 6] = [
@@ -439,7 +473,14 @@ impl Scene {
         for (n, t, quad) in faces {
             let base = vertices.len() as u32;
             for (k, p) in quad.iter().enumerate() {
-                vertices.push(Vertex { pos: *p, normal: n, tangent: t, uv: uvq[k] });
+                vertices.push(Vertex {
+                    pos: *p,
+                    normal: n,
+                    tangent: t,
+                    uv: uvq[k],
+                    joints: [0; 4],
+                    weights: [0.0; 4],
+                });
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
@@ -464,10 +505,12 @@ impl Scene {
                 rotation: Quat::IDENTITY,
                 scale: Vec3::ONE,
                 mesh: Some(0),
+                skin: None,
                 depth: 0,
             }],
             roots: vec![0],
             animations: Vec::new(),
+            skins: Vec::new(),
             bounds,
             extensions_used: Vec::new(),
         }
@@ -574,6 +617,7 @@ pub fn load(path: &std::path::Path) -> Result<Scene, LoadError> {
         .unwrap_or_default();
 
     let animations = parse_animations(doc, &buffers);
+    let skins = parse_skins(doc, &buffers);
 
     let srgb_flags = srgb_usage(&materials, doc.images().count());
     let images = load_images(doc, base, &buffers, &srgb_flags)?;
@@ -586,6 +630,7 @@ pub fn load(path: &std::path::Path) -> Result<Scene, LoadError> {
         nodes,
         roots,
         animations,
+        skins,
         bounds: Aabb::empty(),
         extensions_used: doc.extensions_used().map(|s| s.to_string()).collect(),
     };
@@ -691,6 +736,7 @@ fn build_nodes(doc: &gltf::Document) -> Vec<Node> {
                 rotation: Quat::from_array(r),
                 scale: Vec3::from_array(s),
                 mesh: n.mesh().map(|m| m.index()),
+                skin: n.skin().map(|s| s.index()),
                 depth: 0,
             }
         })
@@ -714,20 +760,65 @@ fn build_nodes(doc: &gltf::Document) -> Vec<Node> {
     nodes
 }
 
-/// Rest-pose (default transforms) world-space AABB, for camera framing.
+/// Rest-pose (default transforms) world-space AABB, for camera framing. Skinned
+/// meshes are posed by their rest joint palette (the mesh node transform is ignored);
+/// static meshes by their node's world matrix.
 fn compute_rest_bounds(scene: &Scene) -> Aabb {
     let world = scene.node_world_matrices(None, 0.0);
     let mut b = Aabb::empty();
     for (i, node) in scene.nodes.iter().enumerate() {
         let Some(mi) = node.mesh else { continue };
+        let palette = node.skin.and_then(|s| scene.skins.get(s)).map(|s| scene.skin_palette(s, &world));
         let m = world[i];
         for prim in &scene.meshes[mi].primitives {
             for v in &prim.vertices {
-                b.expand(m.transform_point3(Vec3::from_array(v.pos)));
+                let p = Vec3::from_array(v.pos);
+                let world_p = match &palette {
+                    Some(pal) => skin_point(p, v.joints, v.weights, pal),
+                    None => m.transform_point3(p),
+                };
+                b.expand(world_p);
             }
         }
     }
     b
+}
+
+/// CPU mirror of the vertex-shader skinning: blend the joint matrices by weight and
+/// transform the point. Used for rest-pose bounds; the GPU does this per-frame.
+fn skin_point(p: Vec3, joints: [u16; 4], weights: [f32; 4], palette: &[Mat4]) -> Vec3 {
+    let mut m = Mat4::ZERO;
+    for k in 0..4 {
+        if weights[k] == 0.0 {
+            continue;
+        }
+        if let Some(j) = palette.get(joints[k] as usize) {
+            m += *j * weights[k];
+        }
+    }
+    // A degenerate (all-zero) blend collapses to identity so bounds stay finite.
+    if m == Mat4::ZERO {
+        return p;
+    }
+    m.transform_point3(p)
+}
+
+/// Parse all glTF skins: joint node lists + inverse bind matrices (defaulting to
+/// identity when the `inverseBindMatrices` accessor is absent, per the spec).
+fn parse_skins(doc: &gltf::Document, buffers: &[Vec<u8>]) -> Vec<Skin> {
+    doc.skins()
+        .map(|s| {
+            let joints: Vec<usize> = s.joints().map(|j| j.index()).collect();
+            let inverse_bind: Vec<Mat4> = match s.inverse_bind_matrices() {
+                Some(acc) => read_attr(&acc, buffers, 16)
+                    .chunks_exact(16)
+                    .map(|c| Mat4::from_cols_array(c.try_into().unwrap()))
+                    .collect(),
+                None => vec![Mat4::IDENTITY; joints.len()],
+            };
+            Skin { joints, inverse_bind, skeleton: s.skeleton().map(|n| n.index()) }
+        })
+        .collect()
 }
 
 /// Parse all glTF animations into keyframe samplers + channels.
@@ -842,12 +933,28 @@ fn load_primitive(
 
     let material = prim.material().index().unwrap_or(default_material);
 
+    // Skinning influences (JOINTS_0 = integer indices; WEIGHTS_0 = float/normalized).
+    // `read_attr` returns joint indices verbatim (non-normalized), so `as u16` is exact.
+    let joints: Vec<[u16; 4]> = match prim.get(&Semantic::Joints(0)) {
+        Some(acc) => read_attr(&acc, buffers, 4)
+            .chunks_exact(4)
+            .map(|c| [c[0] as u16, c[1] as u16, c[2] as u16, c[3] as u16])
+            .collect(),
+        None => vec![[0; 4]; count],
+    };
+    let weights: Vec<[f32; 4]> = match prim.get(&Semantic::Weights(0)) {
+        Some(acc) => read_vec4(&acc, buffers).iter().map(|w| normalize_weights(*w)).collect(),
+        None => vec![[0.0; 4]; count],
+    };
+
     let vertices: Vec<Vertex> = (0..count)
         .map(|i| Vertex {
             pos: positions[i],
             normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
             tangent: tangents.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
             uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+            joints: joints.get(i).copied().unwrap_or([0; 4]),
+            weights: weights.get(i).copied().unwrap_or([0.0; 4]),
         })
         .collect();
 
@@ -1140,6 +1247,17 @@ fn generate_tangents(
             [t_ortho.x, t_ortho.y, t_ortho.z, w]
         })
         .collect()
+}
+
+/// Renormalize the four skin weights to sum to 1 (quantized weights don't exactly),
+/// falling back to full influence from the first joint when they're all ~zero.
+fn normalize_weights(w: [f32; 4]) -> [f32; 4] {
+    let sum = w[0] + w[1] + w[2] + w[3];
+    if sum > 1e-6 {
+        [w[0] / sum, w[1] / sum, w[2] / sum, w[3] / sum]
+    } else {
+        [1.0, 0.0, 0.0, 0.0]
+    }
 }
 
 fn any_perpendicular(n: Vec3) -> Vec3 {

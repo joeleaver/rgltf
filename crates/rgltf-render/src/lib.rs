@@ -58,23 +58,29 @@ struct GpuPrimitive {
 /// One draw: a primitive instantiated by a scene node, with a slice into the shared
 /// instance buffer (`instance_count` = 1 for now; >1 once `EXT_mesh_gpu_instancing`
 /// lands). `node` indexes the per-frame world-matrix array passed to [`Renderer::render`].
+/// `skin` = index into [`GpuScene::skins`] when the node instantiates a skinned mesh.
 struct Draw {
     prim: usize,
     node: usize,
+    skin: Option<usize>,
     instance_base: u32,
     instance_count: u32,
 }
 
-/// Per-instance transform fed to the vertex shader (model + normal matrix).
+/// Per-instance data fed to the vertex shader: the node's model + normal matrix (used
+/// for un-skinned draws), plus a skin selector (`skin[0]` = skinned flag, `skin[1]` =
+/// base offset into the joint palette). Skinned draws ignore `model`/`normal` — their
+/// world transform comes entirely from the joint matrices.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct InstanceRaw {
     model: [[f32; 4]; 4],  // columns → shader locations 4..7
     normal: [[f32; 4]; 3], // normal-matrix columns (xyz) → locations 8..10
+    skin: [u32; 4],        // [skinned, palette_base, _, _] → location 13
 }
 
 impl InstanceRaw {
-    fn from_model(model: Mat4) -> Self {
+    fn new(model: Mat4, skin: Option<u32>) -> Self {
         let n = Mat3::from_mat4(model).inverse().transpose().to_cols_array();
         InstanceRaw {
             model: model.to_cols_array_2d(),
@@ -83,8 +89,20 @@ impl InstanceRaw {
                 [n[3], n[4], n[5], 0.0],
                 [n[6], n[7], n[8], 0.0],
             ],
+            skin: match skin {
+                Some(base) => [1, base, 0, 0],
+                None => [0, 0, 0, 0],
+            },
         }
     }
+}
+
+/// A skin's palette layout: its joint node indices + inverse bind matrices, and the
+/// `base` offset of its slice in the shared joint-matrix storage buffer.
+struct GpuSkin {
+    joints: Vec<usize>,
+    inverse_bind: Vec<Mat4>,
+    base: u32,
 }
 
 /// Everything uploaded for the current scene (dropped/replaced on `set_scene`).
@@ -98,6 +116,13 @@ struct GpuScene {
     draws: Vec<Draw>,
     instance_buffer: Option<wgpu::Buffer>,
     instance_count: u32,
+    skins: Vec<GpuSkin>,
+    /// Concatenated per-skin joint palettes (`joint_count` matrices), rewritten each
+    /// frame from the animated node world matrices. Min 1 element so the bind group is
+    /// always valid, even for un-skinned scenes.
+    joint_buffer: Option<wgpu::Buffer>,
+    joint_bind_group: Option<wgpu::BindGroup>,
+    joint_count: u32,
 }
 
 struct Targets {
@@ -144,6 +169,7 @@ pub struct Renderer {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     material_bgl: wgpu::BindGroupLayout,
+    joint_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -217,6 +243,21 @@ impl Renderer {
             ],
         });
 
+        // Joint-matrix palette: a read-only storage buffer indexed in the vertex shader.
+        let joint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rgltf-joint-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
         let frame_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rgltf-frame-uniform"),
             size: std::mem::size_of::<FrameUniform>() as u64,
@@ -266,15 +307,20 @@ impl Renderer {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rgltf-pl"),
-            bind_group_layouts: &[&frame_bgl, &material_bgl],
+            bind_group_layouts: &[&frame_bgl, &material_bgl, &joint_bgl],
             push_constant_ranges: &[],
         });
 
-        // Vertex buffer 0: per-vertex geometry. Buffer 1: per-instance model+normal.
-        let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2];
+        // Vertex buffer 0: per-vertex geometry + skin influences (locations 0..3, 11, 12).
+        // Buffer 1: per-instance model+normal matrices + skin selector (4..10, 13).
+        let vertex_attrs = wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2,
+            11 => Uint16x4, 12 => Float32x4
+        ];
         let instance_attrs = wgpu::vertex_attr_array![
             4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
-            8 => Float32x4, 9 => Float32x4, 10 => Float32x4
+            8 => Float32x4, 9 => Float32x4, 10 => Float32x4,
+            13 => Uint32x4
         ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("rgltf-pipeline"),
@@ -335,6 +381,7 @@ impl Renderer {
             queue,
             pipeline,
             material_bgl,
+            joint_bgl,
             frame_uniform,
             frame_bind_group,
             sampler,
@@ -501,13 +548,28 @@ impl Renderer {
             mesh_prims.push(ids);
         }
 
-        // Draw list: one draw per (node, primitive), one instance each for now.
+        // Skins: lay each skin's joint palette out contiguously in one storage buffer.
+        let mut base = 0u32;
+        for skin in &scene.skins {
+            let count = skin.joints.len() as u32;
+            gpu.skins.push(GpuSkin {
+                joints: skin.joints.clone(),
+                inverse_bind: skin.inverse_bind.clone(),
+                base,
+            });
+            base += count;
+        }
+        gpu.joint_count = base;
+
+        // Draw list: one draw per (node, primitive), one instance each for now. A node
+        // with a valid skin index draws skinned (palette-driven); otherwise model-driven.
         let mut instance_base = 0u32;
         for (node_idx, node) in scene.nodes.iter().enumerate() {
             let Some(mi) = node.mesh else { continue };
             let Some(ids) = mesh_prims.get(mi) else { continue };
+            let skin = node.skin.filter(|&s| s < gpu.skins.len());
             for &prim in ids {
-                gpu.draws.push(Draw { prim, node: node_idx, instance_base, instance_count: 1 });
+                gpu.draws.push(Draw { prim, node: node_idx, skin, instance_base, instance_count: 1 });
                 instance_base += 1;
             }
         }
@@ -521,6 +583,21 @@ impl Renderer {
                 mapped_at_creation: false,
             }));
         }
+
+        // Joint-matrix palette storage buffer (min 1 element so the bind group is always
+        // valid). Filled per-frame in `render` from the animated node world matrices.
+        let joint_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgltf-joints"),
+            size: gpu.joint_count.max(1) as u64 * std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.joint_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rgltf-joint-bg"),
+            layout: &self.joint_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: joint_buffer.as_entire_binding() }],
+        }));
+        gpu.joint_buffer = Some(joint_buffer);
 
         self.scene = gpu;
     }
@@ -540,7 +617,24 @@ impl Renderer {
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
-        // Per-draw model + normal matrices → shared instance buffer.
+        // Joint-matrix palette: for each skin, `world[joint] · inverse_bind[joint]`,
+        // laid out at the skin's `base` offset. Rewritten every frame (poses animate).
+        if let Some(joint_buf) = &self.scene.joint_buffer {
+            if self.scene.joint_count > 0 {
+                let mut palette = vec![Mat4::IDENTITY; self.scene.joint_count as usize];
+                for skin in &self.scene.skins {
+                    for (j, &node) in skin.joints.iter().enumerate() {
+                        let ibm = skin.inverse_bind.get(j).copied().unwrap_or(Mat4::IDENTITY);
+                        let world = node_world.get(node).copied().unwrap_or(Mat4::IDENTITY);
+                        palette[skin.base as usize + j] = world * ibm;
+                    }
+                }
+                let raw: Vec<[[f32; 4]; 4]> = palette.iter().map(Mat4::to_cols_array_2d).collect();
+                self.queue.write_buffer(joint_buf, 0, bytemuck::cast_slice(&raw));
+            }
+        }
+
+        // Per-draw model + normal matrices (un-skinned) + skin selector → instance buffer.
         if let Some(inst_buf) = &self.scene.instance_buffer {
             let mut instances: Vec<InstanceRaw> =
                 Vec::with_capacity(self.scene.instance_count as usize);
@@ -548,7 +642,8 @@ impl Renderer {
                 let model = node_world.get(draw.node).copied().unwrap_or(Mat4::IDENTITY);
                 // instance_count == 1 for now; multiply by per-instance transforms here
                 // once EXT_mesh_gpu_instancing is wired in.
-                instances.push(InstanceRaw::from_model(model));
+                let skin_base = draw.skin.map(|s| self.scene.skins[s].base);
+                instances.push(InstanceRaw::new(model, skin_base));
             }
             self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
         }
@@ -573,11 +668,14 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if let Some(inst_buf) = &self.scene.instance_buffer {
+            if let (Some(inst_buf), Some(joint_bg)) =
+                (&self.scene.instance_buffer, &self.scene.joint_bind_group)
+            {
                 if !self.scene.draws.is_empty() && !self.scene.materials.is_empty() {
                     let stride = std::mem::size_of::<InstanceRaw>() as u64;
                     pass.set_pipeline(&self.pipeline);
                     pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                    pass.set_bind_group(2, joint_bg, &[]);
                     for draw in &self.scene.draws {
                         let prim = &self.scene.prims[draw.prim];
                         let mat = &self.scene.materials[prim.material];

@@ -120,7 +120,7 @@ fn ui() -> NodeHandle {
                     "Open glTF…"
                 }
                 span { style: "margin-left:auto; color:#7a7a84; font-size:12px;",
-                    "Phase 5 · animation" }
+                    "Phase 5 · skinning" }
             }
 
             // ── Body: scene tree · viewport · inspector ──────────────────
