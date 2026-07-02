@@ -1,9 +1,10 @@
 //! rgltf-render — a from-scratch wgpu PBR renderer for the glTF viewer.
 //!
-//! Phase 2 renders a loaded [`rgltf_asset::Scene`] with metallic-roughness PBR:
-//! per-material bind groups (base-color / metallic-roughness / normal / occlusion
-//! / emissive textures + factors), a directional key light, and a hemisphere
-//! ambient term standing in for IBL. Output is tone-mapped + sRGB-encoded into an
+//! Renders a loaded [`rgltf_asset::Scene`] with metallic-roughness PBR: per-material
+//! bind groups (base-color / metallic-roughness / normal / occlusion / emissive
+//! textures + factors), a directional key light, and split-sum image-based lighting
+//! (irradiance + prefiltered specular + BRDF LUT baked from a procedural environment;
+//! see [`ibl`]) with an analytic skybox. Output is tone-mapped + sRGB-encoded into an
 //! offscreen texture that rinch composites zero-copy.
 
 use std::sync::Arc;
@@ -14,8 +15,12 @@ use rgltf_asset::{AlphaMode, ImageData, Material, MorphTarget, TexFormat, TexRef
 use wgpu::util::DeviceExt;
 
 mod camera;
+mod ibl;
 pub use camera::Camera;
+pub use ibl::EnvParams;
 pub use rgltf_asset::Scene;
+
+use ibl::{Ibl, IblGen, PREFILTER_MIPS};
 
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -24,12 +29,14 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct FrameUniform {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
     light_dir: [f32; 4],
     light_color: [f32; 4],
-    ambient_sky: [f32; 4],
-    ambient_ground: [f32; 4],
-    flags: [f32; 4], // x = use textures (0 = material factors only)
+    env_sky: [f32; 4],
+    env_horizon: [f32; 4],
+    env_ground: [f32; 4],
+    flags: [f32; 4], // x = use textures, y = prefilter mip count, z = IBL intensity
 }
 
 #[repr(C)]
@@ -184,6 +191,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     /// Line-mode variant of `pipeline` (needs the `POLYGON_MODE_LINE` device feature).
     pipeline_wire: wgpu::RenderPipeline,
+    /// Analytic environment backdrop (drawn first, depth writes off).
+    skybox_pipeline: wgpu::RenderPipeline,
     material_bgl: wgpu::BindGroupLayout,
     joint_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
@@ -192,12 +201,18 @@ pub struct Renderer {
     dummy_view: wgpu::TextureView,
     scene: GpuScene,
     targets: Targets,
+    /// IBL machinery (persistent) + the baked environment (rebuilt on env change).
+    ibl_gen: IblGen,
+    ibl: Ibl,
+    env: EnvParams,
     pub clear: wgpu::Color,
     // Lighting (world space).
     pub light_dir: [f32; 3],
     pub light_color: [f32; 3],
-    pub ambient_sky: [f32; 3],
-    pub ambient_ground: [f32; 3],
+    /// Scales the IBL ambient/reflection contribution.
+    pub ibl_intensity: f32,
+    /// Draw the analytic environment behind the model.
+    pub skybox: bool,
     /// Sample material textures (false = show material factors only).
     pub textured: bool,
     /// Draw triangle edges instead of filled faces.
@@ -325,9 +340,12 @@ impl Renderer {
         );
         let dummy_view = dummy.create_view(&Default::default());
 
+        // IBL generator + group-3 bind-group layout (irradiance/prefilter/BRDF-LUT).
+        let ibl_gen = IblGen::new(device.clone(), queue.clone());
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rgltf-pl"),
-            bind_group_layouts: &[&frame_bgl, &material_bgl, &joint_bgl],
+            bind_group_layouts: &[&frame_bgl, &material_bgl, &joint_bgl, ibl_gen.bind_group_layout()],
             push_constant_ranges: &[],
         });
 
@@ -400,6 +418,53 @@ impl Renderer {
         let pipeline = make_pipeline(wgpu::PolygonMode::Fill);
         let pipeline_wire = make_pipeline(wgpu::PolygonMode::Line);
 
+        // Skybox: a fullscreen triangle sharing the frame uniform (group 0 only). No
+        // depth writes and always-pass so it fills the background and meshes overwrite it.
+        let skybox_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgltf-skybox-pl"),
+            bind_group_layouts: &[&frame_bgl],
+            push_constant_ranges: &[],
+        });
+        let skybox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rgltf-skybox"),
+            layout: Some(&skybox_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        // Default environment (Studio-ish); the app overrides it from the lighting preset.
+        let env = EnvParams {
+            sky: [0.42, 0.47, 0.55],
+            horizon: [0.30, 0.30, 0.32],
+            ground: [0.20, 0.18, 0.16],
+        };
+        let ibl = ibl_gen.build(env);
+
         let targets = Targets::new(&device, width, height);
 
         Self {
@@ -407,6 +472,7 @@ impl Renderer {
             queue,
             pipeline,
             pipeline_wire,
+            skybox_pipeline,
             material_bgl,
             joint_bgl,
             frame_uniform,
@@ -415,13 +481,26 @@ impl Renderer {
             dummy_view,
             scene: GpuScene::default(),
             targets,
+            ibl_gen,
+            ibl,
+            env,
             clear: wgpu::Color { r: 0.055, g: 0.065, b: 0.085, a: 1.0 },
             light_dir: [0.5, 0.8, 0.6],
             light_color: [3.0, 3.0, 2.95],
-            ambient_sky: [0.42, 0.47, 0.55],
-            ambient_ground: [0.20, 0.18, 0.16],
+            ibl_intensity: 1.0,
+            skybox: true,
             textured: true,
             wireframe: false,
+        }
+    }
+
+    /// Set the procedural environment (linear radiance). Rebuilds the IBL cubes only
+    /// when the parameters change — cheap no-op otherwise, so it's safe to call every
+    /// frame. The skybox reads the environment straight from the frame uniform.
+    pub fn set_environment(&mut self, env: EnvParams) {
+        if env != self.env {
+            self.env = env;
+            self.ibl = self.ibl_gen.build(env);
         }
     }
 
@@ -657,14 +736,17 @@ impl Renderer {
     /// nodes.
     pub fn render(&mut self, camera: &Camera, node_world: &[Mat4], morph_weights: &[Vec<f32>]) {
         let eye = camera.eye();
+        let view_proj = camera.view_proj();
         let frame = FrameUniform {
-            view_proj: camera.view_proj().to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
             light_dir: [self.light_dir[0], self.light_dir[1], self.light_dir[2], 0.0],
             light_color: [self.light_color[0], self.light_color[1], self.light_color[2], 1.0],
-            ambient_sky: [self.ambient_sky[0], self.ambient_sky[1], self.ambient_sky[2], 1.0],
-            ambient_ground: [self.ambient_ground[0], self.ambient_ground[1], self.ambient_ground[2], 1.0],
-            flags: [if self.textured { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            env_sky: [self.env.sky[0], self.env.sky[1], self.env.sky[2], 1.0],
+            env_horizon: [self.env.horizon[0], self.env.horizon[1], self.env.horizon[2], 1.0],
+            env_ground: [self.env.ground[0], self.env.ground[1], self.env.ground[2], 1.0],
+            flags: [if self.textured { 1.0 } else { 0.0 }, PREFILTER_MIPS as f32, self.ibl_intensity, 0.0],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
@@ -758,6 +840,12 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // Environment backdrop (behind everything; depth writes off).
+            if self.skybox {
+                pass.set_pipeline(&self.skybox_pipeline);
+                pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
             if let (Some(inst_buf), Some(joint_bg)) =
                 (&self.scene.instance_buffer, &self.scene.joint_bind_group)
             {
@@ -767,6 +855,7 @@ impl Renderer {
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.frame_bind_group, &[]);
                     pass.set_bind_group(2, joint_bg, &[]);
+                    pass.set_bind_group(3, &self.ibl.bind_group, &[]);
                     for draw in &self.scene.draws {
                         let prim = &self.scene.prims[draw.prim];
                         let mat = &self.scene.materials[prim.material];

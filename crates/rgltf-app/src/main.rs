@@ -58,20 +58,23 @@ struct ClipInfo {
     name: String,
 }
 
-/// A named lighting preset (key-light direction/colour + hemisphere ambient).
+/// A named lighting preset: the analytic key light (the "sun") plus the procedural
+/// environment gradient (zenith `sky` / equator `horizon` / nadir `ground`) that
+/// drives the IBL and the skybox. Colours are linear radiance.
 struct LightPreset {
     name: &'static str,
     dir: [f32; 3],
     color: [f32; 3],
     sky: [f32; 3],
+    horizon: [f32; 3],
     ground: [f32; 3],
 }
 
 const LIGHT_PRESETS: &[LightPreset] = &[
-    LightPreset { name: "Studio", dir: [0.5, 0.8, 0.6], color: [3.0, 3.0, 2.95], sky: [0.42, 0.47, 0.55], ground: [0.20, 0.18, 0.16] },
-    LightPreset { name: "Day", dir: [0.3, 0.9, 0.25], color: [3.3, 3.1, 2.7], sky: [0.50, 0.60, 0.78], ground: [0.26, 0.23, 0.18] },
-    LightPreset { name: "Sunset", dir: [0.85, 0.28, 0.35], color: [3.6, 1.9, 1.05], sky: [0.38, 0.30, 0.42], ground: [0.16, 0.10, 0.12] },
-    LightPreset { name: "Night", dir: [0.35, 0.7, -0.5], color: [0.7, 0.85, 1.2], sky: [0.08, 0.10, 0.17], ground: [0.03, 0.03, 0.06] },
+    LightPreset { name: "Studio", dir: [0.5, 0.8, 0.6], color: [3.0, 3.0, 2.95], sky: [0.42, 0.47, 0.55], horizon: [0.32, 0.33, 0.36], ground: [0.20, 0.18, 0.16] },
+    LightPreset { name: "Day", dir: [0.3, 0.9, 0.25], color: [3.3, 3.1, 2.7], sky: [0.28, 0.45, 0.78], horizon: [0.58, 0.62, 0.66], ground: [0.26, 0.23, 0.18] },
+    LightPreset { name: "Sunset", dir: [0.85, 0.28, 0.35], color: [3.6, 1.9, 1.05], sky: [0.24, 0.26, 0.42], horizon: [0.78, 0.42, 0.26], ground: [0.14, 0.09, 0.10] },
+    LightPreset { name: "Night", dir: [0.35, 0.7, -0.5], color: [0.7, 0.85, 1.2], sky: [0.05, 0.07, 0.15], horizon: [0.08, 0.10, 0.16], ground: [0.02, 0.02, 0.05] },
 ];
 
 #[derive(Clone)]
@@ -732,8 +735,11 @@ impl App {
             r.wireframe = mode == RenderMode::Wireframe;
             r.light_dir = preset.dir;
             r.light_color = preset.color;
-            r.ambient_sky = preset.sky;
-            r.ambient_ground = preset.ground;
+            r.set_environment(rgltf_render::EnvParams {
+                sky: preset.sky,
+                horizon: preset.horizon,
+                ground: preset.ground,
+            });
         }
 
         // Advance the animation clock (real-time delta, only while playing).

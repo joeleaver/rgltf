@@ -1,17 +1,20 @@
-// Phase 2 — metallic-roughness PBR with normal mapping, a single directional
-// key light, and a cheap hemisphere-ambient term standing in for IBL (so metals
-// aren't black). ACES tone map + sRGB encode into the Rgba8Unorm target.
+// Metallic-roughness PBR with normal mapping, a directional key light (the "sun"),
+// and split-sum image-based lighting (irradiance + prefiltered specular + BRDF LUT,
+// group 3) for the ambient/reflection term. ACES tone map + sRGB encode into the
+// Rgba8Unorm target. Also hosts the analytic skybox (vs_sky/fs_sky).
 
 const PI: f32 = 3.14159265359;
 
 struct Frame {
     view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     cam_pos: vec4<f32>,
     light_dir: vec4<f32>,   // xyz = direction TO the light
     light_color: vec4<f32>, // rgb * intensity
-    ambient_sky: vec4<f32>,
-    ambient_ground: vec4<f32>,
-    flags: vec4<f32>,       // x = use material textures (0 = factors only)
+    env_sky: vec4<f32>,     // environment zenith radiance (linear)
+    env_horizon: vec4<f32>, // environment horizon-band radiance
+    env_ground: vec4<f32>,  // environment nadir radiance
+    flags: vec4<f32>,       // x = use material textures, y = prefilter mip count, z = IBL intensity
 };
 
 struct Material {
@@ -35,6 +38,13 @@ struct Material {
 // Skinning: the joint-matrix palette (all skins concatenated; each draw's slice starts
 // at its per-instance `skin.y` base). Already world-space (world[joint]·inverseBind).
 @group(2) @binding(0) var<storage, read> joint_matrices: array<mat4x4<f32>>;
+
+// Image-based lighting (baked from the current environment; see ibl.rs).
+@group(3) @binding(0) var irr_cube: texture_cube<f32>;   // diffuse irradiance
+@group(3) @binding(1) var pre_cube: texture_cube<f32>;   // prefiltered specular (roughness mips)
+@group(3) @binding(2) var brdf_lut: texture_2d<f32>;     // split-sum env-BRDF (scale, bias)
+@group(3) @binding(3) var cube_samp: sampler;
+@group(3) @binding(4) var lut_samp: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -212,14 +222,18 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         }
     }
 
-    // Hemisphere ambient (cheap IBL stand-in).
-    let sky = frame.ambient_sky.rgb;
-    let ground = frame.ambient_ground.rgb;
-    let diff_irr = mix(ground, sky, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
-    let r = reflect(-v, n);
-    let spec_irr = mix(ground, sky, clamp(r.y * 0.5 + 0.5, 0.0, 1.0));
+    // Image-based lighting (split-sum): diffuse irradiance + prefiltered specular,
+    // combined with the precomputed environment-BRDF LUT.
     let f_amb = f_schlick_rough(n_dot_v, f0, rough);
-    let ambient = (diff_irr * diffuse_color * (vec3<f32>(1.0) - f_amb) + spec_irr * f_amb) * ao;
+    let kd = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
+    let irradiance = textureSample(irr_cube, cube_samp, n).rgb;
+    let diffuse_ibl = irradiance * albedo;
+    let refl = reflect(-v, n);
+    let max_mip = max(frame.flags.y - 1.0, 0.0);
+    let prefiltered = textureSampleLevel(pre_cube, cube_samp, refl, rough * max_mip).rgb;
+    let env_brdf = textureSample(brdf_lut, lut_samp, vec2<f32>(n_dot_v, rough)).rg;
+    let specular_ibl = prefiltered * (f0 * env_brdf.x + env_brdf.y);
+    let ambient = (kd * diffuse_ibl + specular_ibl) * ao * frame.flags.z;
 
     // Emissive.
     var emissive = mat.emissive.rgb * mat.emissive.w;
@@ -229,4 +243,41 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     let color = lo + ambient + emissive;
     return vec4<f32>(to_srgb(aces(color)), base.a);
+}
+
+// ── Skybox ────────────────────────────────────────────────────────────────────
+// The analytic environment behind the model. Drawn first each frame with depth
+// writes off, so meshes overwrite it. The direction is reconstructed by unprojecting
+// the far-plane NDC through `inv_view_proj`. Uses the same gradient as the baked env
+// cube (ibl.wgsl `sky_radiance`) so the background matches the reflections/lighting.
+
+struct SkyOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
+    let x = f32(i32(i) / 2) * 4.0 - 1.0;
+    let y = f32(i32(i) % 2) * 4.0 - 1.0;
+    var o: SkyOut;
+    o.pos = vec4<f32>(x, y, 1.0, 1.0);
+    o.ndc = vec2<f32>(x, y);
+    return o;
+}
+
+fn sky_gradient(d: vec3<f32>) -> vec3<f32> {
+    let t = clamp(d.y, -1.0, 1.0);
+    if (t >= 0.0) {
+        return mix(frame.env_horizon.rgb, frame.env_sky.rgb, pow(t, 0.45));
+    }
+    return mix(frame.env_horizon.rgb, frame.env_ground.rgb, pow(-t, 0.45));
+}
+
+@fragment
+fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
+    let clip = vec4<f32>(in.ndc, 1.0, 1.0);
+    let world = frame.inv_view_proj * clip;
+    let dir = normalize(world.xyz / world.w - frame.cam_pos.xyz);
+    return vec4<f32>(to_srgb(aces(sky_gradient(dir))), 1.0);
 }
