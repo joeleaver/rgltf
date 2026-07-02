@@ -116,6 +116,10 @@ struct GpuScene {
     draws: Vec<Draw>,
     instance_buffer: Option<wgpu::Buffer>,
     instance_count: u32,
+    /// Per-instance-slot *local* transform (relative to the draw's node), aligned with
+    /// the instance buffer. `EXT_mesh_gpu_instancing` fills this; un-instanced draws get
+    /// a single identity. Final model = `node_world[draw.node] · instances_local[slot]`.
+    instances_local: Vec<Mat4>,
     skins: Vec<GpuSkin>,
     /// Concatenated per-skin joint palettes (`joint_count` matrices), rewritten each
     /// frame from the animated node world matrices. Min 1 element so the bind group is
@@ -561,16 +565,25 @@ impl Renderer {
         }
         gpu.joint_count = base;
 
-        // Draw list: one draw per (node, primitive), one instance each for now. A node
-        // with a valid skin index draws skinned (palette-driven); otherwise model-driven.
+        // Draw list: one draw per (node, primitive). Each draw reserves `instance_count`
+        // consecutive instance slots, whose local transforms go into `instances_local`.
+        // A node with `EXT_mesh_gpu_instancing` draws its instances (model-driven, one per
+        // instance); else a valid skin draws skinned (palette-driven); else a single draw.
         let mut instance_base = 0u32;
         for (node_idx, node) in scene.nodes.iter().enumerate() {
             let Some(mi) = node.mesh else { continue };
             let Some(ids) = mesh_prims.get(mi) else { continue };
-            let skin = node.skin.filter(|&s| s < gpu.skins.len());
+            // Instancing takes precedence over skinning (they aren't combined).
+            let (locals, skin): (&[Mat4], Option<usize>) = if !node.instances.is_empty() {
+                (&node.instances, None)
+            } else {
+                (&[Mat4::IDENTITY], node.skin.filter(|&s| s < gpu.skins.len()))
+            };
             for &prim in ids {
-                gpu.draws.push(Draw { prim, node: node_idx, skin, instance_base, instance_count: 1 });
-                instance_base += 1;
+                let count = locals.len() as u32;
+                gpu.instances_local.extend_from_slice(locals);
+                gpu.draws.push(Draw { prim, node: node_idx, skin, instance_base, instance_count: count });
+                instance_base += count;
             }
         }
         gpu.instance_count = instance_base;
@@ -634,16 +647,19 @@ impl Renderer {
             }
         }
 
-        // Per-draw model + normal matrices (un-skinned) + skin selector → instance buffer.
+        // Per-instance model + normal matrices (un-skinned) + skin selector → instance
+        // buffer. Each instance slot's world model = node_world · its local transform
+        // (identity for un-instanced draws; the EXT_mesh_gpu_instancing TRS otherwise).
         if let Some(inst_buf) = &self.scene.instance_buffer {
             let mut instances: Vec<InstanceRaw> =
                 Vec::with_capacity(self.scene.instance_count as usize);
             for draw in &self.scene.draws {
-                let model = node_world.get(draw.node).copied().unwrap_or(Mat4::IDENTITY);
-                // instance_count == 1 for now; multiply by per-instance transforms here
-                // once EXT_mesh_gpu_instancing is wired in.
+                let node_mat = node_world.get(draw.node).copied().unwrap_or(Mat4::IDENTITY);
                 let skin_base = draw.skin.map(|s| self.scene.skins[s].base);
-                instances.push(InstanceRaw::new(model, skin_base));
+                for slot in draw.instance_base..draw.instance_base + draw.instance_count {
+                    let local = self.scene.instances_local.get(slot as usize).copied().unwrap_or(Mat4::IDENTITY);
+                    instances.push(InstanceRaw::new(node_mat * local, skin_base));
+                }
             }
             self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
         }

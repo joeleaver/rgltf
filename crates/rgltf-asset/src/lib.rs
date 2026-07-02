@@ -202,6 +202,9 @@ pub struct Node {
     pub mesh: Option<usize>,
     /// Index into [`Scene::skins`] when this node instantiates a *skinned* mesh.
     pub skin: Option<usize>,
+    /// `EXT_mesh_gpu_instancing`: per-instance *local* transforms (relative to this
+    /// node). Empty = a single implicit instance at the node's own transform.
+    pub instances: Vec<Mat4>,
     pub depth: u32,
 }
 
@@ -506,6 +509,7 @@ impl Scene {
                 scale: Vec3::ONE,
                 mesh: Some(0),
                 skin: None,
+                instances: Vec::new(),
                 depth: 0,
             }],
             roots: vec![0],
@@ -609,7 +613,12 @@ pub fn load(path: &std::path::Path) -> Result<Scene, LoadError> {
         .collect();
 
     // Node hierarchy + the default scene's root nodes.
-    let nodes = build_nodes(doc);
+    let mut nodes = build_nodes(doc);
+    // EXT_mesh_gpu_instancing: per-node instance transforms (read from raw JSON — the
+    // gltf crate doesn't surface this extension typed).
+    for (node, instances) in nodes.iter_mut().zip(parse_node_instances(doc, &buffers, &root)) {
+        node.instances = instances;
+    }
     let roots: Vec<usize> = doc
         .default_scene()
         .or_else(|| doc.scenes().next())
@@ -737,6 +746,7 @@ fn build_nodes(doc: &gltf::Document) -> Vec<Node> {
                 scale: Vec3::from_array(s),
                 mesh: n.mesh().map(|m| m.index()),
                 skin: n.skin().map(|s| s.index()),
+                instances: Vec::new(),
                 depth: 0,
             }
         })
@@ -768,6 +778,19 @@ fn compute_rest_bounds(scene: &Scene) -> Aabb {
     let mut b = Aabb::empty();
     for (i, node) in scene.nodes.iter().enumerate() {
         let Some(mi) = node.mesh else { continue };
+        // Instancing (static; one AABB contribution per instance) takes precedence over
+        // skinning — the two aren't combined.
+        if !node.instances.is_empty() {
+            for inst in &node.instances {
+                let m = world[i] * *inst;
+                for prim in &scene.meshes[mi].primitives {
+                    for v in &prim.vertices {
+                        b.expand(m.transform_point3(Vec3::from_array(v.pos)));
+                    }
+                }
+            }
+            continue;
+        }
         let palette = node.skin.and_then(|s| scene.skins.get(s)).map(|s| scene.skin_palette(s, &world));
         let m = world[i];
         for prim in &scene.meshes[mi].primitives {
@@ -819,6 +842,53 @@ fn parse_skins(doc: &gltf::Document, buffers: &[Vec<u8>]) -> Vec<Skin> {
             Skin { joints, inverse_bind, skeleton: s.skeleton().map(|n| n.index()) }
         })
         .collect()
+}
+
+/// Parse `EXT_mesh_gpu_instancing` per node into local instance transforms. Each of
+/// TRANSLATION / ROTATION / SCALE is optional (defaulting to 0 / identity / 1); the
+/// instance count is the length of whichever attribute is present. Read from raw JSON
+/// (the gltf crate has no typed accessor for this extension).
+fn parse_node_instances(
+    doc: &gltf::Document,
+    buffers: &[Vec<u8>],
+    root: &serde_json::Value,
+) -> Vec<Vec<Mat4>> {
+    let mut out = vec![Vec::new(); doc.nodes().count()];
+    let Some(nodes_json) = root.get("nodes").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    let acc_by_index = |name: &str, attrs: &serde_json::Value| -> Option<gltf::Accessor> {
+        let idx = attrs.get(name).and_then(|v| v.as_u64())? as usize;
+        doc.accessors().nth(idx)
+    };
+    for (i, njson) in nodes_json.iter().enumerate() {
+        let Some(attrs) = njson.pointer("/extensions/EXT_mesh_gpu_instancing/attributes") else {
+            continue;
+        };
+        let ts = acc_by_index("TRANSLATION", attrs).map(|a| read_vec3(&a, buffers));
+        let rs = acc_by_index("ROTATION", attrs).map(|a| read_vec4(&a, buffers));
+        let ss = acc_by_index("SCALE", attrs).map(|a| read_vec3(&a, buffers));
+        let count = [ts.as_ref().map(Vec::len), rs.as_ref().map(Vec::len), ss.as_ref().map(Vec::len)]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
+        if i >= out.len() {
+            continue;
+        }
+        out[i] = (0..count)
+            .map(|k| {
+                let t = ts.as_ref().and_then(|v| v.get(k)).map_or(Vec3::ZERO, |v| Vec3::from_array(*v));
+                let r = rs
+                    .as_ref()
+                    .and_then(|v| v.get(k))
+                    .map_or(Quat::IDENTITY, |v| Quat::from_array(*v).normalize());
+                let s = ss.as_ref().and_then(|v| v.get(k)).map_or(Vec3::ONE, |v| Vec3::from_array(*v));
+                Mat4::from_scale_rotation_translation(s, r, t)
+            })
+            .collect();
+    }
+    out
 }
 
 /// Parse all glTF animations into keyframe samplers + channels.
