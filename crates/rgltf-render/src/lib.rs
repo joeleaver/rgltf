@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
-use rgltf_asset::{AlphaMode, ImageData, Material, TexFormat, TexRef};
+use rgltf_asset::{AlphaMode, ImageData, Material, MorphTarget, TexFormat, TexRef, Vertex};
 use wgpu::util::DeviceExt;
 
 mod camera;
@@ -47,12 +47,21 @@ struct GpuMaterial {
     bind_group: wgpu::BindGroup,
 }
 
-/// Per-mesh-primitive GPU geometry (local space, uploaded once).
+/// CPU-side morph data for a primitive: the base (un-morphed) vertices + the per-target
+/// deltas. Present only for morph primitives; drives the per-frame vertex re-upload.
+struct MorphCpu {
+    base: Vec<Vertex>,
+    targets: Vec<MorphTarget>,
+}
+
+/// Per-mesh-primitive GPU geometry (local space). Uploaded once, unless `morph` is set —
+/// then `vbuf` is `COPY_DST` and rewritten each frame from the base + weighted deltas.
 struct GpuPrimitive {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
     material: usize,
+    morph: Option<MorphCpu>,
 }
 
 /// One draw: a primitive instantiated by a scene node, with a slice into the shared
@@ -531,10 +540,17 @@ impl Renderer {
                 if prim.vertices.is_empty() || prim.indices.is_empty() {
                     continue;
                 }
+                // Morph primitives need a rewritable vertex buffer (re-uploaded per frame).
+                let morphed = !prim.morph_targets.is_empty();
+                let vusage = if morphed {
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
+                } else {
+                    wgpu::BufferUsages::VERTEX
+                };
                 let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("rgltf-prim-vbuf"),
                     contents: bytemuck::cast_slice(&prim.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: vusage,
                 });
                 let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("rgltf-prim-ibuf"),
@@ -547,6 +563,10 @@ impl Renderer {
                     ibuf,
                     index_count: prim.indices.len() as u32,
                     material: prim.material.min(gpu.materials.len().saturating_sub(1)),
+                    morph: morphed.then(|| MorphCpu {
+                        base: prim.vertices.clone(),
+                        targets: prim.morph_targets.clone(),
+                    }),
                 });
             }
             mesh_prims.push(ids);
@@ -615,10 +635,11 @@ impl Renderer {
         self.scene = gpu;
     }
 
-    /// Render one frame. `node_world` is the world matrix per scene node (indexed by
-    /// [`rgltf_asset::Scene`] node index) — evaluate `Scene::node_world_matrices` at the
-    /// current animation time and pass it here.
-    pub fn render(&mut self, camera: &Camera, node_world: &[Mat4]) {
+    /// Render one frame. `node_world` is the world matrix per scene node (from
+    /// `Scene::node_world_matrices` at the current time); `morph_weights` is the active
+    /// morph-weight vector per node (from `Scene::morph_weights`), empty for un-morphed
+    /// nodes.
+    pub fn render(&mut self, camera: &Camera, node_world: &[Mat4], morph_weights: &[Vec<f32>]) {
         let eye = camera.eye();
         let frame = FrameUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
@@ -629,6 +650,42 @@ impl Renderer {
             ambient_ground: [self.ambient_ground[0], self.ambient_ground[1], self.ambient_ground[2], 1.0],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
+
+        // Morph targets: rewrite each morph primitive's vertex buffer from base + Σ
+        // weight·delta (position/normal/tangent), using the weights of the node that
+        // instantiates it. Normals/tangents are renormalized in the shader. (A morph mesh
+        // shared by several nodes with different weights uses the last draw's weights.)
+        for draw in &self.scene.draws {
+            let prim = &self.scene.prims[draw.prim];
+            let Some(morph) = &prim.morph else { continue };
+            let mut verts = morph.base.clone();
+            if let Some(w) = morph_weights.get(draw.node) {
+                for (t, tgt) in morph.targets.iter().enumerate() {
+                    let wt = w.get(t).copied().unwrap_or(0.0);
+                    if wt == 0.0 {
+                        continue;
+                    }
+                    for (i, v) in verts.iter_mut().enumerate() {
+                        if let Some(d) = tgt.positions.get(i) {
+                            for k in 0..3 {
+                                v.pos[k] += wt * d[k];
+                            }
+                        }
+                        if let Some(d) = tgt.normals.get(i) {
+                            for k in 0..3 {
+                                v.normal[k] += wt * d[k];
+                            }
+                        }
+                        if let Some(d) = tgt.tangents.get(i) {
+                            for k in 0..3 {
+                                v.tangent[k] += wt * d[k];
+                            }
+                        }
+                    }
+                }
+            }
+            self.queue.write_buffer(&prim.vbuf, 0, bytemuck::cast_slice(&verts));
+        }
 
         // Joint-matrix palette: for each skin, `world[joint] · inverse_bind[joint]`,
         // laid out at the skin's `base` offset. Rewritten every frame (poses animate).

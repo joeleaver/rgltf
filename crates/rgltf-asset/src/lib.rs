@@ -61,13 +61,25 @@ pub struct Vertex {
     pub weights: [f32; 4],
 }
 
+/// One morph target's per-vertex **deltas** (added to the base attribute, weighted by
+/// the active morph weight). Each vector is either empty (no delta for that attribute)
+/// or one entry per base vertex. `tangents` are xyz deltas only (`tangent.w` is fixed).
+#[derive(Clone, Debug, Default)]
+pub struct MorphTarget {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub tangents: Vec<[f32; 3]>,
+}
+
 /// A drawable primitive: **local-space** geometry (node transforms are applied at
-/// draw time, not baked) + an index into [`Scene::materials`].
+/// draw time, not baked) + an index into [`Scene::materials`]. `morph_targets` (if any)
+/// carry per-vertex deltas blended by the node's morph weights.
 #[derive(Debug)]
 pub struct Primitive {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub material: usize,
+    pub morph_targets: Vec<MorphTarget>,
 }
 
 // ── Materials / textures / images ──────────────────────────────────────────────
@@ -184,9 +196,18 @@ pub struct ImageData {
 // ── Scene graph ─────────────────────────────────────────────────────────────
 
 /// A mesh: a bundle of local-space primitives, instantiated by one or more nodes.
+/// `weights` are the default morph weights (overridable per node / by animation).
 #[derive(Debug)]
 pub struct Mesh {
     pub primitives: Vec<Primitive>,
+    pub weights: Vec<f32>,
+}
+
+impl Mesh {
+    /// Number of morph targets (0 if not a morph mesh); taken from the first primitive.
+    pub fn num_targets(&self) -> usize {
+        self.primitives.first().map_or(0, |p| p.morph_targets.len())
+    }
 }
 
 /// A scene-graph node. The local transform is stored decomposed (TRS) so animation
@@ -205,6 +226,8 @@ pub struct Node {
     /// `EXT_mesh_gpu_instancing`: per-instance *local* transforms (relative to this
     /// node). Empty = a single implicit instance at the node's own transform.
     pub instances: Vec<Mat4>,
+    /// Morph-weight override for this node's mesh (else the mesh's default weights).
+    pub weights: Option<Vec<f32>>,
     pub depth: u32,
 }
 
@@ -258,31 +281,32 @@ pub struct AnimSampler {
 }
 
 impl AnimSampler {
-    /// Values-per-keyframe stride in `output` (3× for cubic spline's tangents).
-    fn stride(&self) -> usize {
+    /// Values-per-keyframe stride in `output` for `c` components (3× for cubic spline's
+    /// tangents). `c` is the sampler's own `components` for TRS, but for morph weights it
+    /// is the target count (the output is a flat SCALAR accessor of `keyframes × targets`).
+    fn stride_c(&self, c: usize) -> usize {
         match self.interpolation {
-            Interpolation::CubicSpline => self.components * 3,
-            _ => self.components,
+            Interpolation::CubicSpline => c * 3,
+            _ => c,
         }
     }
 
-    /// The `components` values of keyframe `k`. For cubic spline this is the *value*
-    /// slice (middle third), skipping the in/out tangents.
-    fn value(&self, k: usize) -> &[f32] {
-        let s = self.stride();
+    /// The `c` values of keyframe `k`. For cubic spline this is the *value* slice
+    /// (middle third), skipping the in/out tangents.
+    fn value_c(&self, k: usize, c: usize) -> &[f32] {
+        let s = self.stride_c(c);
         let base = k * s
             + match self.interpolation {
-                Interpolation::CubicSpline => self.components, // skip inTangent
+                Interpolation::CubicSpline => c, // skip inTangent
                 _ => 0,
             };
-        &self.output[base..base + self.components]
+        &self.output[base..base + c]
     }
 
-    /// Cubic-spline in/out tangents of keyframe `k`.
-    fn tangents(&self, k: usize) -> (&[f32], &[f32]) {
-        let s = self.stride();
+    /// Cubic-spline in/out tangents of keyframe `k` (`c` components each).
+    fn tangents_c(&self, k: usize, c: usize) -> (&[f32], &[f32]) {
+        let s = self.stride_c(c);
         let base = k * s;
-        let c = self.components;
         (&self.output[base..base + c], &self.output[base + 2 * c..base + 3 * c])
     }
 
@@ -306,25 +330,25 @@ impl AnimSampler {
         (i, i + 1, frac, dt)
     }
 
-    /// Sample `components` scalars at time `t` (used for translation/scale/weights).
-    fn sample(&self, t: f32) -> Vec<f32> {
-        let c = self.components;
+    /// Sample `c` scalars at time `t` (translation/scale use `components`; morph weights
+    /// pass the target count).
+    fn sample_c(&self, t: f32, c: usize) -> Vec<f32> {
         if self.input.is_empty() {
             return vec![0.0; c];
         }
         let (i0, i1, f, dt) = self.bracket(t);
         match self.interpolation {
-            Interpolation::Step => self.value(i0).to_vec(),
+            Interpolation::Step => self.value_c(i0, c).to_vec(),
             Interpolation::Linear => {
-                let a = self.value(i0);
-                let b = self.value(i1);
+                let a = self.value_c(i0, c);
+                let b = self.value_c(i1, c);
                 (0..c).map(|k| a[k] + (b[k] - a[k]) * f).collect()
             }
             Interpolation::CubicSpline => {
-                let v0 = self.value(i0).to_vec();
-                let v1 = self.value(i1).to_vec();
-                let (_, out0) = self.tangents(i0);
-                let (in1, _) = self.tangents(i1);
+                let v0 = self.value_c(i0, c).to_vec();
+                let v1 = self.value_c(i1, c).to_vec();
+                let (_, out0) = self.tangents_c(i0, c);
+                let (in1, _) = self.tangents_c(i1, c);
                 let (f2, f3) = (f * f, f * f * f);
                 let (h00, h10) = (2.0 * f3 - 3.0 * f2 + 1.0, f3 - 2.0 * f2 + f);
                 let (h01, h11) = (-2.0 * f3 + 3.0 * f2, f3 - f2);
@@ -336,7 +360,7 @@ impl AnimSampler {
     }
 
     fn sample_vec3(&self, t: f32) -> Vec3 {
-        let v = self.sample(t);
+        let v = self.sample_c(t, 3);
         Vec3::new(v[0], v[1], v[2])
     }
 
@@ -347,7 +371,7 @@ impl AnimSampler {
             return Quat::IDENTITY;
         }
         let q = |k: usize| {
-            let v = self.value(k);
+            let v = self.value_c(k, 4);
             Quat::from_xyzw(v[0], v[1], v[2], v[3])
         };
         let (i0, i1, f, _dt) = self.bracket(t);
@@ -355,11 +379,17 @@ impl AnimSampler {
             Interpolation::Step => q(i0),
             Interpolation::Linear => q(i0).slerp(q(i1), f),
             Interpolation::CubicSpline => {
-                let v = self.sample(t);
+                let v = self.sample_c(t, 4);
                 Quat::from_xyzw(v[0], v[1], v[2], v[3])
             }
         };
         result.normalize()
+    }
+
+    /// Sample the `n` morph-target weights at time `t`. The output accessor is a flat
+    /// SCALAR array of `keyframes × n` (so `self.components` is 1 and unused here).
+    fn sample_weights(&self, t: f32, n: usize) -> Vec<f32> {
+        self.sample_c(t, n)
     }
 }
 
@@ -446,6 +476,41 @@ impl Scene {
         world
     }
 
+    /// Effective morph weights per node at animation `time`: the node's weight override
+    /// (else the mesh's default weights, else zeros), with any `Weights` animation
+    /// channel applied on top. An empty vec for nodes without a morph mesh.
+    pub fn morph_weights(&self, anim: Option<usize>, time: f32) -> Vec<Vec<f32>> {
+        let targets_of = |node: &Node| node.mesh.and_then(|m| self.meshes.get(m)).map_or(0, Mesh::num_targets);
+        let mut out: Vec<Vec<f32>> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let nt = targets_of(n);
+                if nt == 0 {
+                    return Vec::new();
+                }
+                let default = n.mesh.and_then(|m| self.meshes.get(m)).map(|m| &m.weights);
+                match n.weights.as_ref().filter(|w| w.len() == nt).or(default) {
+                    Some(w) if w.len() == nt => w.clone(),
+                    _ => vec![0.0; nt],
+                }
+            })
+            .collect();
+        if let Some(a) = anim.and_then(|i| self.animations.get(i)) {
+            for ch in a.channels.iter().filter(|c| c.path == AnimPath::Weights) {
+                let Some(node) = self.nodes.get(ch.node) else { continue };
+                let nt = targets_of(node);
+                if nt == 0 {
+                    continue;
+                }
+                if let Some(s) = a.samplers.get(ch.sampler) {
+                    out[ch.node] = s.sample_weights(time, nt);
+                }
+            }
+        }
+        out
+    }
+
     /// Joint-matrix palette for `skin` given per-node world matrices: one matrix per
     /// joint = `world[joint] · inverse_bind[joint]`, mapping bind-pose mesh-space
     /// vertices to world space. Feed the result to the skinning vertex shader.
@@ -497,7 +562,15 @@ impl Scene {
         mat.roughness_factor = 0.55;
         Scene {
             name: "cube".into(),
-            meshes: vec![Mesh { primitives: vec![Primitive { vertices, indices, material: 0 }] }],
+            meshes: vec![Mesh {
+                primitives: vec![Primitive {
+                    vertices,
+                    indices,
+                    material: 0,
+                    morph_targets: Vec::new(),
+                }],
+                weights: Vec::new(),
+            }],
             materials: vec![mat],
             images: Vec::new(),
             nodes: vec![Node {
@@ -510,6 +583,7 @@ impl Scene {
                 mesh: Some(0),
                 skin: None,
                 instances: Vec::new(),
+                weights: None,
                 depth: 0,
             }],
             roots: vec![0],
@@ -609,6 +683,7 @@ pub fn load(path: &std::path::Path) -> Result<Scene, LoadError> {
                 .primitives()
                 .filter_map(|p| load_primitive(&p, &buffers, default_index))
                 .collect(),
+            weights: m.weights().map(<[f32]>::to_vec).unwrap_or_default(),
         })
         .collect();
 
@@ -747,6 +822,7 @@ fn build_nodes(doc: &gltf::Document) -> Vec<Node> {
                 mesh: n.mesh().map(|m| m.index()),
                 skin: n.skin().map(|s| s.index()),
                 instances: Vec::new(),
+                weights: n.weights().map(<[f32]>::to_vec),
                 depth: 0,
             }
         })
@@ -1028,7 +1104,18 @@ fn load_primitive(
         })
         .collect();
 
-    Some(Primitive { vertices, indices, material })
+    // Morph targets: per-vertex POSITION/NORMAL/TANGENT deltas (blended by node weights
+    // at draw time). read_vec3 keeps quantized/normalized deltas correct.
+    let morph_targets: Vec<MorphTarget> = prim
+        .morph_targets()
+        .map(|mt| MorphTarget {
+            positions: mt.positions().map(|a| read_vec3(&a, buffers)).unwrap_or_default(),
+            normals: mt.normals().map(|a| read_vec3(&a, buffers)).unwrap_or_default(),
+            tangents: mt.tangents().map(|a| read_vec3(&a, buffers)).unwrap_or_default(),
+        })
+        .collect();
+
+    Some(Primitive { vertices, indices, material, morph_targets })
 }
 
 // ── Buffer resolution ─────────────────────────────────────────────────────────

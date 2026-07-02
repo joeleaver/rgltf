@@ -522,18 +522,18 @@ impl App {
         self.camera.set_aspect(vw as f32 / vh.max(1) as f32);
 
         // Evaluate the scene at the current animation time and render the 3D.
-        let world = match &self.scene {
+        let (world, morph) = match &self.scene {
             Some(scene) => {
                 let time = match self.anim.and_then(|i| scene.animations.get(i)) {
                     Some(clip) => self.start.elapsed().as_secs_f32() % clip.duration.max(1e-4),
                     None => 0.0,
                 };
-                scene.node_world_matrices(self.anim, time)
+                (scene.node_world_matrices(self.anim, time), scene.morph_weights(self.anim, time))
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         let scene_view = if let Some(r) = &mut self.renderer {
-            r.render(&self.camera, &world);
+            r.render(&self.camera, &world, &morph);
             Some(r.color_target().1)
         } else {
             None
