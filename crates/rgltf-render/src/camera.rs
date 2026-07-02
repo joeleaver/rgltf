@@ -106,4 +106,23 @@ impl Camera {
         let vt = (self.fovy * 0.5).tan();
         (vt * self.aspect.max(1e-3)).atan()
     }
+
+    /// Pull back far enough to fit the framed sphere in the FOV (with margin).
+    fn fit_distance(&self) -> f32 {
+        let half = (self.fovy * 0.5).min(self.horizontal_half_fov());
+        (self.radius / half.sin().max(1e-4)) * 1.25
+    }
+
+    /// Snap to a view angle (keeps the current target + content radius) and re-fit the
+    /// distance so the model fills the frame. Used by the camera-preset buttons.
+    pub fn set_view(&mut self, yaw: f32, pitch: f32) {
+        self.yaw = yaw;
+        self.pitch = pitch.clamp(-1.5, 1.5);
+        self.distance = self.fit_distance();
+    }
+
+    /// Restore the default 3/4 framing of the current content (the "reset" button).
+    pub fn refit(&mut self) {
+        self.set_view(0.7, 0.45);
+    }
 }

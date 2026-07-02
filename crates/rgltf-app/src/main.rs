@@ -10,7 +10,7 @@
 //! native file dialog.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -77,12 +77,32 @@ const LIGHT_PRESETS: &[LightPreset] = &[
     LightPreset { name: "Night", dir: [0.35, 0.7, -0.5], color: [0.7, 0.85, 1.2], sky: [0.05, 0.07, 0.15], horizon: [0.08, 0.10, 0.16], ground: [0.02, 0.02, 0.05] },
 ];
 
+/// Axis-aligned camera presets: `(label, yaw, pitch)` in radians. Applied via
+/// [`Camera::set_view`] (keeps the framed target, re-fits the distance).
+const CAMERA_VIEWS: &[(&str, f32, f32)] = &[
+    ("Front", 0.0, 0.0),
+    ("Back", std::f32::consts::PI, 0.0),
+    ("Left", -std::f32::consts::FRAC_PI_2, 0.0),
+    ("Right", std::f32::consts::FRAC_PI_2, 0.0),
+    ("Top", 0.0, 1.5),
+    ("Bottom", 0.0, -1.5),
+];
+
+/// A one-shot camera action from the Camera-section buttons (consumed each frame).
+#[derive(Clone, Copy)]
+enum CamCmd {
+    Reset,
+    View(usize),
+}
+
 #[derive(Clone)]
 struct UiState {
     tree_rows: Signal<Vec<TreeRow>>,
     status: Signal<String>,
     render_mode: Signal<RenderMode>,
     lighting: Signal<usize>,
+    /// Draw the environment skybox behind the model (else a solid clear colour).
+    skybox: Signal<bool>,
     clips: Signal<Vec<ClipInfo>>,
     clip: Signal<usize>,
     playing: Signal<bool>,
@@ -98,6 +118,8 @@ thread_local! {
     static UI_STATE: RefCell<Option<UiState>> = const { RefCell::new(None) };
     /// Set by the "Open glTF…" button's onclick; polled by the render loop.
     static OPEN_REQUESTED: Cell<bool> = const { Cell::new(false) };
+    /// One-shot camera command from the Camera-section buttons; consumed each frame.
+    static CAMERA_CMD: Cell<Option<CamCmd>> = const { Cell::new(None) };
 }
 
 fn build_rows(scene: &Scene) -> Vec<TreeRow> {
@@ -138,6 +160,13 @@ const OPEN_BTN: &str = "width:100%; padding:8px 10px; border-radius:7px; border:
 const SECTION_LABEL: &str = "font-size:11px; text-transform:uppercase; letter-spacing:0.6px; \
                              color:#7a7a84; margin-bottom:8px;";
 const BTN_ROW: &str = "display:flex; gap:6px; flex-wrap:wrap;";
+/// Neutral full-width button (e.g. "Reset view").
+const SUBTLE_BTN: &str = "width:100%; padding:6px; border-radius:6px; border:1px solid #3a3a42; \
+                          background:#2b2b31; color:#c2c2ca; cursor:pointer; font-size:12px;";
+/// Camera-view preset button: ~3 per row (flex-basis 28% wraps to two rows of three).
+const VIEW_BTN: &str = "flex:1 1 28%; min-width:0; padding:6px 2px; border-radius:6px; \
+                        border:1px solid #3a3a42; background:#2b2b31; color:#c2c2ca; \
+                        cursor:pointer; font-size:11px; text-align:center; white-space:nowrap;";
 
 /// Style for a segmented toggle button, highlighted when `active`.
 fn seg_btn(active: bool) -> String {
@@ -166,6 +195,7 @@ fn ui() -> NodeHandle {
     let status = Signal::new(String::from("Ready"));
     let render_mode = Signal::new(RenderMode::Textured);
     let lighting = Signal::new(0usize);
+    let skybox = Signal::new(true);
     let clips = Signal::new(Vec::<ClipInfo>::new());
     let clip = Signal::new(0usize);
     let playing = Signal::new(true);
@@ -177,6 +207,7 @@ fn ui() -> NodeHandle {
             status,
             render_mode,
             lighting,
+            skybox,
             clips,
             clip,
             playing,
@@ -197,7 +228,7 @@ fn ui() -> NodeHandle {
     rsx! {
         div {
             style: "display:flex; flex-direction:column; height:100vh; overflow:hidden; \
-                    font-family: system-ui, sans-serif; background:#1e1e22; color:#dcdce0;",
+                    font-family: system-ui, sans-serif; background:#161618; color:#dcdce0;",
 
             // ── Body: scene tree · viewport · controls ──────────────────
             div {
@@ -206,7 +237,7 @@ fn ui() -> NodeHandle {
                 // Left: scene tree
                 div {
                     style: "width:240px; flex-shrink:0; padding:12px 8px; overflow:auto; \
-                            background:#232327; border-right:1px solid #35353c;",
+                            background:#1b1b1e; border-right:1px solid #35353c;",
                     div { style: SECTION_LABEL, "Scene" }
                     for row in tree_rows.get() {
                         div {
@@ -231,7 +262,7 @@ fn ui() -> NodeHandle {
                 // Right: controls
                 div {
                     style: "width:230px; flex-shrink:0; padding:14px; overflow:auto; \
-                            background:#232327; border-left:1px solid #35353c; \
+                            background:#1b1b1e; border-left:1px solid #35353c; \
                             display:flex; flex-direction:column; gap:18px;",
 
                     button { onclick: on_open, style: OPEN_BTN, "Open glTF…" }
@@ -254,6 +285,26 @@ fn ui() -> NodeHandle {
                                 onclick: move || render_mode.set(RenderMode::Wireframe),
                                 style: {move || seg_btn(render_mode.get() == RenderMode::Wireframe)},
                                 "Wire"
+                            }
+                        }
+                    }
+
+                    // Camera: reset + axis-aligned view presets (momentary buttons).
+                    div {
+                        div { style: SECTION_LABEL, "Camera" }
+                        button {
+                            onclick: move || CAMERA_CMD.with(|c| c.set(Some(CamCmd::Reset))),
+                            style: SUBTLE_BTN,
+                            "Reset view"
+                        }
+                        div { style: "display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;",
+                            for i in 0..CAMERA_VIEWS.len() {
+                                button {
+                                    key: i,
+                                    onclick: move || CAMERA_CMD.with(|c| c.set(Some(CamCmd::View(i)))),
+                                    style: VIEW_BTN,
+                                    {CAMERA_VIEWS[i].0.to_string()}
+                                }
                             }
                         }
                     }
@@ -313,14 +364,31 @@ fn ui() -> NodeHandle {
                         }
                     }
 
+                    // Background: environment skybox vs a solid clear colour.
+                    div {
+                        div { style: SECTION_LABEL, "Background" }
+                        div { style: BTN_ROW,
+                            button {
+                                onclick: move || skybox.set(true),
+                                style: {move || seg_btn(skybox.get())},
+                                "Sky"
+                            }
+                            button {
+                                onclick: move || skybox.set(false),
+                                style: {move || seg_btn(!skybox.get())},
+                                "Solid"
+                            }
+                        }
+                    }
+
                     div { style: "margin-top:auto; color:#6f6f78; font-size:12px; line-height:1.7;",
-                        "Drag to orbit · Scroll to zoom" }
+                        "Drag to orbit · Scroll to zoom · Drop a glTF to open" }
                 }
             }
 
             // ── Status bar ───────────────────────────────────────────────
             div {
-                style: "padding:5px 14px; background:#26262b; border-top:1px solid #35353c; \
+                style: "padding:5px 14px; background:#18181b; border-top:1px solid #35353c; \
                         font-size:12px; color:#9a9aa2; white-space:nowrap; overflow:hidden; \
                         text-overflow:ellipsis;",
                 {move || status.get()}
@@ -361,7 +429,13 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment fn fs_ui(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(t, s, in.uv);
+    // The overlay (Vello) holds premultiplied, sRGB-encoded colours in a linear-format
+    // texture. Linearize so the sRGB swapchain re-encodes them exactly once (sampling
+    // verbatim double-encodes and washes the UI out — panels look far lighter than their
+    // authored hex) and so the premultiplied-alpha blend happens in linear space. Mirrors
+    // fs_scene. (For anti-aliased edges premult-then-linearize is a negligible approximation.)
+    let c = textureSample(t, s, in.uv);
+    return vec4<f32>(srgb_to_linear(c.rgb), c.a);
 }
 "#;
 
@@ -643,6 +717,9 @@ impl App {
     fn ui_lighting(&self) -> usize {
         UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.lighting.get())).unwrap_or(0)
     }
+    fn ui_skybox(&self) -> bool {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.skybox.get())).unwrap_or(true)
+    }
     fn ui_playing(&self) -> bool {
         UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.playing.get())).unwrap_or(true)
     }
@@ -669,20 +746,26 @@ impl App {
         });
     }
 
+    /// Load a glTF/GLB from disk, applying it on success or surfacing the error in the
+    /// status bar. Shared by the "Open glTF…" dialog and drag-and-drop.
+    fn load_file(&mut self, path: &Path) {
+        match rgltf_asset::load(path) {
+            Ok(scene) => self.apply_scene(scene),
+            Err(e) => UI_STATE.with(|s| {
+                if let Some(ui) = s.borrow().as_ref() {
+                    ui.status.set(format!("Failed to open: {e}"));
+                }
+            }),
+        }
+    }
+
     fn open_dialog(&mut self) {
         let picked = rfd::FileDialog::new()
             .set_title("Open glTF / GLB")
             .add_filter("glTF", &["glb", "gltf"])
             .pick_file();
         if let Some(path) = picked {
-            match rgltf_asset::load(&path) {
-                Ok(scene) => self.apply_scene(scene),
-                Err(e) => UI_STATE.with(|s| {
-                    if let Some(ui) = s.borrow().as_ref() {
-                        ui.status.set(format!("Failed to open: {e}"));
-                    }
-                }),
-            }
+            self.load_file(&path);
         }
     }
 
@@ -727,12 +810,26 @@ impl App {
         }
         self.camera.set_aspect(vw as f32 / vh.max(1) as f32);
 
+        // Apply any one-shot camera-preset command (after set_aspect so the re-fit
+        // distance accounts for the current viewport aspect).
+        if let Some(cmd) = CAMERA_CMD.with(|c| c.take()) {
+            match cmd {
+                CamCmd::Reset => self.camera.refit(),
+                CamCmd::View(i) => {
+                    let (_, yaw, pitch) = CAMERA_VIEWS[i.min(CAMERA_VIEWS.len() - 1)];
+                    self.camera.set_view(yaw, pitch);
+                }
+            }
+        }
+
         // Apply the right-panel controls to the renderer.
         let mode = self.ui_render_mode();
+        let skybox_on = self.ui_skybox();
         let preset = &LIGHT_PRESETS[self.ui_lighting().min(LIGHT_PRESETS.len() - 1)];
         if let Some(r) = &mut self.renderer {
             r.textured = mode == RenderMode::Textured;
             r.wireframe = mode == RenderMode::Wireframe;
+            r.skybox = skybox_on;
             r.light_dir = preset.dir;
             r.light_color = preset.color;
             r.set_environment(rgltf_render::EnvParams {
@@ -893,6 +990,17 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::SurfaceResized(size) => self.handle_resize(size.width, size.height),
+            WindowEvent::DragDropped { paths, .. } => {
+                // Load the first dropped path that looks like a glTF/GLB.
+                if let Some(path) = paths.into_iter().find(|p| {
+                    matches!(
+                        p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+                        Some("glb") | Some("gltf")
+                    )
+                }) {
+                    self.load_file(&path);
+                }
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(ctx) = &mut self.rinch_ctx {
                     ctx.set_scale_factor(scale_factor);
