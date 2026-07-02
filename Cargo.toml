@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/rgltf"
+
+[workspace.dependencies]
+# Internal crates
+rgltf-render = { path = "crates/rgltf-render" }
+rgltf-asset = { path = "crates/rgltf-asset" }
+
+# rinch — path-depend on the local checkout so rgltf builds against the working
+# tree. rinch re-exports its own (patched) wgpu as `rinch::wgpu`; we depend on
+# `wgpu` directly too and rely on the [patch.crates-io] block below to unify the
+# two into a single crate instance (required for zero-copy texture handoff).
+rinch = { path = "/home/joe/dev/rinch/crates/rinch", default-features = false }
+
+# Rendering / math. `wgpu = "27"` resolves to the rinch fork (v27.0.1) via the
+# patch below — same crate instance rinch links, so wgpu::Texture handed to
+# `set_texture_source` type-checks.
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+
+# glTF parsing (+ material/extension accessors) and native file dialog.
+gltf = { version = "1", features = [
+    "KHR_materials_emissive_strength",
+    "KHR_materials_unlit",
+    "KHR_lights_punctual",
+    "KHR_texture_transform",
+    "KHR_materials_variants",
+    "extras",
+    "names",
+] }
+rfd = "0.15"
+
+# gltfpack extension decode.
+meshopt = "0.6"
+serde_json = "1"
+
+# KTX2/Basis transcode (KHR_texture_basisu) via Khronos KTX-Software. Static link
+# (libktx-rs-sys's default). Built with cmake — see .cargo/config.toml for the
+# CMAKE_POLICY_VERSION_MINIMUM shim needed by the bundled basisu CMakeLists.
+libktx-rs = "0.3"
+# PNG/JPEG image decode for non-KTX2 textures.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# base64 decode for `data:` URIs (embedded .gltf buffers/images).
+base64 = "0.22"
+
+# Asset pipeline crates are added per-phase (gltf, meshopt, ktx2, basis-universal,
+# image) so the Phase-0 integration build stays lean and free of C-toolchain deps.
+
+# ── wgpu / winit fork lockstep with rinch ─────────────────────────────────────
+# [patch] is only read from the ROOT workspace, never from a path dependency's
+# workspace, so we must replicate rinch's patch set verbatim. If these drift from
+# rinch/Cargo.toml, wgpu type unification breaks and the app won't link.
+[patch.crates-io]
+wgpu = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-core = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-hal = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-types = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+naga = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+winit = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-core = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+
+[profile.dev]
+# Debug builds of Stylo/Parley/wgpu are painfully slow; optimize deps but keep
+# our own crates debuggable (matches rinch's guidance to run --release).
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

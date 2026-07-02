@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+# Sample assets can be large; keep them out of git unless explicitly added.
+/assets/models/

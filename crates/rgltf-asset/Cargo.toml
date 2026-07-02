@@ -1,0 +1,20 @@
+[package]
+name = "rgltf-asset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gltf = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+meshopt = { workspace = true }
+serde_json = { workspace = true }
+# KTX2/Basis transcode (KHR_texture_basisu). Wraps Khronos KTX-Software; handles
+# both ETC1S/BasisLZ (gltfpack `-tc` default) and UASTC (`-tc -tu`) → BC7/RGBA.
+libktx-rs = { workspace = true }
+# PNG/JPEG decode for non-KTX2 glTF images (replaces gltf::import_images so the
+# KTX2 and PNG/JPEG paths can coexist in one file).
+image = { workspace = true }
+# base64 decode for `data:` URIs (embedded .gltf buffers/images).
+base64 = { workspace = true }

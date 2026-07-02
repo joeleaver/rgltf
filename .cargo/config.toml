@@ -1,0 +1,6 @@
+# libktx-rs-sys builds KTX-Software (v4.0.0) via cmake, but its bundled `basisu`
+# CMakeLists declares `cmake_minimum_required(2.8.12)`, which cmake ≥4 rejects.
+# This env var makes cmake treat too-old minimums as 3.5 so the build proceeds.
+# force=true so it applies even if the ambient env doesn't set it.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }

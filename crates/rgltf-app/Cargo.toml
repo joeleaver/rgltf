@@ -1,0 +1,17 @@
+[package]
+name = "rgltf-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rgltf"
+path = "src/main.rs"
+
+[dependencies]
+# `gpu` = wgpu/Vello compositor + shared-device handoff; `debug` = the MCP bridge
+# (lets Claude screenshot/inspect the running viewer). `components`/`theme` for UI.
+rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme", "debug"] }
+rgltf-render = { workspace = true }
+rgltf-asset = { workspace = true }
+rfd = { workspace = true }

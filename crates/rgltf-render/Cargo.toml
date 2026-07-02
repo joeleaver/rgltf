@@ -1,0 +1,11 @@
+[package]
+name = "rgltf-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+rgltf-asset = { workspace = true }
