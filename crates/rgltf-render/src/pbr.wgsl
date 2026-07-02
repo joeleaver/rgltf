@@ -11,6 +11,7 @@ struct Frame {
     light_color: vec4<f32>, // rgb * intensity
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
+    flags: vec4<f32>,       // x = use material textures (0 = factors only)
 };
 
 struct Material {
@@ -131,9 +132,12 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    // Global toggle: when off, ignore all material textures (show factors only).
+    let use_tex = frame.flags.x > 0.5;
+
     // Base color (texture is sRGB → auto-linearized on sample).
     var base = mat.base_color_factor;
-    if (mat.flags.x > 0.5) {
+    if (mat.flags.x > 0.5 && use_tex) {
         base = base * textureSample(t_base, samp, in.uv);
     }
 
@@ -156,7 +160,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     // Normal mapping.
     var n = ng;
-    if (mat.flags.z > 0.5) {
+    if (mat.flags.z > 0.5 && use_tex) {
         let ts = textureSample(t_normal, samp, in.uv).xyz * 2.0 - 1.0;
         let scaled = vec3<f32>(ts.xy * mat.params.z, ts.z);
         let t = normalize(in.tangent - ng * dot(ng, in.tangent));
@@ -168,7 +172,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     // Metallic / roughness.
     var metallic = mat.params.x;
     var rough = mat.params.y;
-    if (mat.flags.y > 0.5) {
+    if (mat.flags.y > 0.5 && use_tex) {
         let mr = textureSample(t_mr, samp, in.uv);
         rough = rough * mr.g;
         metallic = metallic * mr.b;
@@ -178,7 +182,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     // Occlusion.
     var ao = 1.0;
-    if (mat.flags.w > 0.5) {
+    if (mat.flags.w > 0.5 && use_tex) {
         let occ = textureSample(t_occlusion, samp, in.uv).r;
         ao = 1.0 + mat.params.w * (occ - 1.0);
     }
@@ -219,7 +223,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     // Emissive.
     var emissive = mat.emissive.rgb * mat.emissive.w;
-    if (mat.flags2.x > 0.5) {
+    if (mat.flags2.x > 0.5 && use_tex) {
         emissive = emissive * textureSample(t_emissive, samp, in.uv).rgb;
     }
 

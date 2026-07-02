@@ -43,10 +43,52 @@ struct TreeRow {
     has_mesh: bool,
 }
 
+/// How the 3D is drawn (right-panel "Render" toggle).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Textured,
+    Untextured,
+    Wireframe,
+}
+
+/// One selectable animation clip (index + display name).
+#[derive(Clone, PartialEq)]
+struct ClipInfo {
+    idx: usize,
+    name: String,
+}
+
+/// A named lighting preset (key-light direction/colour + hemisphere ambient).
+struct LightPreset {
+    name: &'static str,
+    dir: [f32; 3],
+    color: [f32; 3],
+    sky: [f32; 3],
+    ground: [f32; 3],
+}
+
+const LIGHT_PRESETS: &[LightPreset] = &[
+    LightPreset { name: "Studio", dir: [0.5, 0.8, 0.6], color: [3.0, 3.0, 2.95], sky: [0.42, 0.47, 0.55], ground: [0.20, 0.18, 0.16] },
+    LightPreset { name: "Day", dir: [0.3, 0.9, 0.25], color: [3.3, 3.1, 2.7], sky: [0.50, 0.60, 0.78], ground: [0.26, 0.23, 0.18] },
+    LightPreset { name: "Sunset", dir: [0.85, 0.28, 0.35], color: [3.6, 1.9, 1.05], sky: [0.38, 0.30, 0.42], ground: [0.16, 0.10, 0.12] },
+    LightPreset { name: "Night", dir: [0.35, 0.7, -0.5], color: [0.7, 0.85, 1.2], sky: [0.08, 0.10, 0.17], ground: [0.03, 0.03, 0.06] },
+];
+
 #[derive(Clone)]
 struct UiState {
     tree_rows: Signal<Vec<TreeRow>>,
     status: Signal<String>,
+    render_mode: Signal<RenderMode>,
+    lighting: Signal<usize>,
+    clips: Signal<Vec<ClipInfo>>,
+    clip: Signal<usize>,
+    playing: Signal<bool>,
+    /// Timeline position as a fraction 0..1 of the current clip. Written by the app each
+    /// frame while playing (thumb follows playback); written by the scrubber's `onchange`
+    /// (with playback paused) while the user drags.
+    scrub: Signal<f64>,
+    /// Current clip duration in seconds (for the timeline readout).
+    duration: Signal<f64>,
 }
 
 thread_local! {
@@ -88,11 +130,57 @@ fn build_status(scene: &Scene) -> String {
 
 // ── UI component (embedded rinch DOM) ─────────────────────────────────────────
 
+const OPEN_BTN: &str = "width:100%; padding:8px 10px; border-radius:7px; border:1px solid #3f6ea8; \
+                        background:#35557f; color:#fff; cursor:pointer; font-size:13px; font-weight:600;";
+const SECTION_LABEL: &str = "font-size:11px; text-transform:uppercase; letter-spacing:0.6px; \
+                             color:#7a7a84; margin-bottom:8px;";
+const BTN_ROW: &str = "display:flex; gap:6px; flex-wrap:wrap;";
+
+/// Style for a segmented toggle button, highlighted when `active`.
+fn seg_btn(active: bool) -> String {
+    format!(
+        "flex:1 1 0; min-width:0; padding:6px 4px; border-radius:6px; border:1px solid {}; \
+         background:{}; color:{}; cursor:pointer; font-size:12px; text-align:center; white-space:nowrap;",
+        if active { "#4a7fc0" } else { "#3a3a42" },
+        if active { "#35557f" } else { "#2b2b31" },
+        if active { "#ffffff" } else { "#c2c2ca" },
+    )
+}
+
+/// Full-width play/pause button; highlighted (invites a click) while paused.
+fn play_btn(playing: bool) -> String {
+    format!(
+        "width:100%; padding:7px; border-radius:6px; border:1px solid {}; background:{}; \
+         color:#fff; cursor:pointer; font-size:13px; font-weight:600;",
+        if playing { "#3a3a42" } else { "#4a7fc0" },
+        if playing { "#2b2b31" } else { "#35557f" },
+    )
+}
+
 #[component]
 fn ui() -> NodeHandle {
     let tree_rows = Signal::new(Vec::<TreeRow>::new());
     let status = Signal::new(String::from("Ready"));
-    UI_STATE.with(|s| *s.borrow_mut() = Some(UiState { tree_rows, status }));
+    let render_mode = Signal::new(RenderMode::Textured);
+    let lighting = Signal::new(0usize);
+    let clips = Signal::new(Vec::<ClipInfo>::new());
+    let clip = Signal::new(0usize);
+    let playing = Signal::new(true);
+    let scrub = Signal::new(0.0f64);
+    let duration = Signal::new(0.0f64);
+    UI_STATE.with(|s| {
+        *s.borrow_mut() = Some(UiState {
+            tree_rows,
+            status,
+            render_mode,
+            lighting,
+            clips,
+            clip,
+            playing,
+            scrub,
+            duration,
+        })
+    });
 
     // The transparent hole the 3D is composited into. `data-viewport` lets
     // `RinchContext::viewport_rect` find its rect and `wants_mouse` treat it as the
@@ -108,30 +196,15 @@ fn ui() -> NodeHandle {
             style: "display:flex; flex-direction:column; height:100vh; overflow:hidden; \
                     font-family: system-ui, sans-serif; background:#1e1e22; color:#dcdce0;",
 
-            // ── Toolbar ──────────────────────────────────────────────────
-            div {
-                style: "display:flex; align-items:center; gap:12px; padding:8px 14px; \
-                        background:#26262b; border-bottom:1px solid #35353c;",
-                span { style: "font-weight:700; letter-spacing:0.5px;", "rgltf" }
-                button {
-                    onclick: on_open,
-                    style: "padding:4px 10px; border-radius:6px; border:1px solid #3a3a42; \
-                            background:#2f2f36; color:#dcdce0; cursor:pointer; font-size:13px;",
-                    "Open glTF…"
-                }
-                span { style: "margin-left:auto; color:#7a7a84; font-size:12px;",
-                    "Phase 5 · instancing" }
-            }
-
-            // ── Body: scene tree · viewport · inspector ──────────────────
+            // ── Body: scene tree · viewport · controls ──────────────────
             div {
                 style: "display:flex; flex:1; min-height:0;",
 
+                // Left: scene tree
                 div {
-                    style: "width:260px; flex-shrink:0; padding:10px 8px; overflow:auto; \
+                    style: "width:240px; flex-shrink:0; padding:12px 8px; overflow:auto; \
                             background:#232327; border-right:1px solid #35353c;",
-                    div { style: "font-size:11px; text-transform:uppercase; letter-spacing:0.6px; \
-                                  color:#7a7a84; margin:0 0 8px 6px;", "Scene" }
+                    div { style: SECTION_LABEL, "Scene" }
                     for row in tree_rows.get() {
                         div {
                             key: row.id,
@@ -152,13 +225,93 @@ fn ui() -> NodeHandle {
 
                 {viewport}
 
+                // Right: controls
                 div {
-                    style: "width:280px; flex-shrink:0; padding:12px; overflow:auto; \
-                            background:#232327; border-left:1px solid #35353c;",
-                    div { style: "font-size:11px; text-transform:uppercase; letter-spacing:0.6px; \
-                                  color:#7a7a84; margin-bottom:8px;", "Inspector" }
-                    div { style: "color:#9a9aa2; font-size:13px; line-height:1.7;",
-                        "Drag to orbit" br {} "Scroll to zoom" br {} "Open a .glb / .gltf file" }
+                    style: "width:230px; flex-shrink:0; padding:14px; overflow:auto; \
+                            background:#232327; border-left:1px solid #35353c; \
+                            display:flex; flex-direction:column; gap:18px;",
+
+                    button { onclick: on_open, style: OPEN_BTN, "Open glTF…" }
+
+                    // Render mode
+                    div {
+                        div { style: SECTION_LABEL, "Render" }
+                        div { style: BTN_ROW,
+                            button {
+                                onclick: move || render_mode.set(RenderMode::Textured),
+                                style: {move || seg_btn(render_mode.get() == RenderMode::Textured)},
+                                "Textured"
+                            }
+                            button {
+                                onclick: move || render_mode.set(RenderMode::Untextured),
+                                style: {move || seg_btn(render_mode.get() == RenderMode::Untextured)},
+                                "Shaded"
+                            }
+                            button {
+                                onclick: move || render_mode.set(RenderMode::Wireframe),
+                                style: {move || seg_btn(render_mode.get() == RenderMode::Wireframe)},
+                                "Wire"
+                            }
+                        }
+                    }
+
+                    // Animation (only when the scene has clips)
+                    if !clips.get().is_empty() {
+                        div {
+                            div { style: SECTION_LABEL, "Animation" }
+                            button {
+                                onclick: move || playing.update(|p| *p = !*p),
+                                style: {move || play_btn(playing.get())},
+                                {move || if playing.get() { "Pause".to_string() } else { "Play".to_string() }}
+                            }
+                            // Timeline scrubber: dragging seeks and pauses; the thumb
+                            // follows playback (the app writes `scrub` each frame).
+                            Slider {
+                                min: 0.0,
+                                max: 1.0,
+                                step: 0.001,
+                                size: "sm",
+                                value_signal: scrub,
+                                onchange: move |v: f64| { scrub.set(v); playing.set(false); },
+                                style: "margin-top:12px;",
+                            }
+                            div {
+                                style: "margin-top:4px; font-size:11px; color:#8a8a92; \
+                                        font-variant-numeric:tabular-nums;",
+                                {move || { let d = duration.get(); format!("{:.1}s / {:.1}s", scrub.get() * d, d) }}
+                            }
+                            if clips.get().len() > 1 {
+                                div { style: "display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;",
+                                    for c in clips.get() {
+                                        button {
+                                            key: c.idx,
+                                            onclick: { let i = c.idx; move || clip.set(i) },
+                                            style: { let i = c.idx; move || seg_btn(clip.get() == i) },
+                                            {c.name.clone()}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Lighting presets
+                    div {
+                        div { style: SECTION_LABEL, "Lighting" }
+                        div { style: BTN_ROW,
+                            for i in 0..LIGHT_PRESETS.len() {
+                                button {
+                                    key: i,
+                                    onclick: move || lighting.set(i),
+                                    style: {move || seg_btn(lighting.get() == i)},
+                                    {LIGHT_PRESETS[i].name.to_string()}
+                                }
+                            }
+                        }
+                    }
+
+                    div { style: "margin-top:auto; color:#6f6f78; font-size:12px; line-height:1.7;",
+                        "Drag to orbit · Scroll to zoom" }
                 }
             }
 
@@ -230,8 +383,9 @@ struct App {
     renderer: Option<Renderer>,
     camera: Camera,
     scene: Option<Scene>,
-    anim: Option<usize>,
-    start: Instant,
+    /// Accumulated animation clock (seconds), advanced only while `playing`.
+    anim_time: f32,
+    last_frame: Instant,
 
     dragging: bool,
     mouse_phys: (f32, f32),
@@ -256,8 +410,8 @@ impl App {
             renderer: None,
             camera: Camera::new(1.0),
             scene: None,
-            anim: None,
-            start: Instant::now(),
+            anim_time: 0.0,
+            last_frame: Instant::now(),
             dragging: false,
             mouse_phys: (0.0, 0.0),
             pending_events: Vec::new(),
@@ -312,8 +466,9 @@ impl App {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rgltf-device"),
-            // KTX2/Basis textures transcode to BC7 (see rgltf-asset).
-            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+            // BC: KTX2/Basis transcode to BC7 (see rgltf-asset). POLYGON_MODE_LINE: wireframe.
+            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+                | wgpu::Features::POLYGON_MODE_LINE,
             required_limits: wgpu::Limits::default(),
             memory_hints: Default::default(),
             trace: Default::default(),
@@ -445,22 +600,70 @@ impl App {
         self.apply_scene(initial);
     }
 
-    /// Upload a scene, frame the camera, select the first animation, refresh the UI.
+    /// Upload a scene, frame the camera, reset playback, refresh the UI (tree + clips).
     fn apply_scene(&mut self, scene: Scene) {
         if let Some(r) = &mut self.renderer {
             r.set_scene(&scene);
         }
         let (center, radius) = rgltf_render::scene_sphere(&scene);
         self.camera.frame(center, radius);
-        self.anim = if scene.animations.is_empty() { None } else { Some(0) };
-        self.start = Instant::now();
+        self.anim_time = 0.0;
+        let clips: Vec<ClipInfo> = scene
+            .animations
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| ClipInfo {
+                idx,
+                name: if a.name.is_empty() { format!("Clip {}", idx + 1) } else { a.name.clone() },
+            })
+            .collect();
         UI_STATE.with(|s| {
             if let Some(ui) = s.borrow().as_ref() {
                 ui.tree_rows.set(build_rows(&scene));
                 ui.status.set(build_status(&scene));
+                ui.clips.set(clips);
+                ui.clip.set(0);
+                ui.playing.set(true);
+                ui.scrub.set(0.0);
+                ui.duration.set(scene.animations.first().map_or(0.0, |a| a.duration as f64));
             }
         });
         self.scene = Some(scene);
+    }
+
+    // ── UI control readouts (signals live in UI_STATE, read each frame) ──
+    fn ui_render_mode(&self) -> RenderMode {
+        UI_STATE
+            .with(|s| s.borrow().as_ref().map(|u| u.render_mode.get()))
+            .unwrap_or(RenderMode::Textured)
+    }
+    fn ui_lighting(&self) -> usize {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.lighting.get())).unwrap_or(0)
+    }
+    fn ui_playing(&self) -> bool {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.playing.get())).unwrap_or(true)
+    }
+    fn ui_clip(&self) -> usize {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.clip.get())).unwrap_or(0)
+    }
+    fn ui_scrub(&self) -> f64 {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.scrub.get())).unwrap_or(0.0)
+    }
+    fn set_ui_scrub(&self, frac: f64) {
+        UI_STATE.with(|s| {
+            if let Some(u) = s.borrow().as_ref() {
+                u.scrub.set(frac);
+            }
+        });
+    }
+    fn set_ui_duration(&self, d: f64) {
+        UI_STATE.with(|s| {
+            if let Some(u) = s.borrow().as_ref() {
+                if (u.duration.get() - d).abs() > 1e-4 {
+                    u.duration.set(d);
+                }
+            }
+        });
     }
 
     fn open_dialog(&mut self) {
@@ -521,15 +724,53 @@ impl App {
         }
         self.camera.set_aspect(vw as f32 / vh.max(1) as f32);
 
+        // Apply the right-panel controls to the renderer.
+        let mode = self.ui_render_mode();
+        let preset = &LIGHT_PRESETS[self.ui_lighting().min(LIGHT_PRESETS.len() - 1)];
+        if let Some(r) = &mut self.renderer {
+            r.textured = mode == RenderMode::Textured;
+            r.wireframe = mode == RenderMode::Wireframe;
+            r.light_dir = preset.dir;
+            r.light_color = preset.color;
+            r.ambient_sky = preset.sky;
+            r.ambient_ground = preset.ground;
+        }
+
+        // Advance the animation clock (real-time delta, only while playing).
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+
+        // Selected clip + its duration (short scene borrow, released before mutations).
+        let (anim, dur) = match &self.scene {
+            Some(scene) if !scene.animations.is_empty() => {
+                let i = self.ui_clip().min(scene.animations.len() - 1);
+                (Some(i), scene.animations[i].duration.max(1e-4))
+            }
+            _ => (None, 0.0),
+        };
+        // Playing → advance the clock and push the timeline position; paused → take the
+        // time from the scrubber (so dragging seeks). `anim_time` stays in sync so Play
+        // resumes from wherever the scrubber left off.
+        let time = if anim.is_some() {
+            self.set_ui_duration(dur as f64);
+            if self.ui_playing() {
+                self.anim_time += dt;
+                let t = self.anim_time % dur;
+                self.set_ui_scrub((t / dur) as f64);
+                t
+            } else {
+                let t = (self.ui_scrub().clamp(0.0, 1.0) as f32) * dur;
+                self.anim_time = t;
+                t
+            }
+        } else {
+            0.0
+        };
+
         // Evaluate the scene at the current animation time and render the 3D.
         let (world, morph) = match &self.scene {
-            Some(scene) => {
-                let time = match self.anim.and_then(|i| scene.animations.get(i)) {
-                    Some(clip) => self.start.elapsed().as_secs_f32() % clip.duration.max(1e-4),
-                    None => 0.0,
-                };
-                (scene.node_world_matrices(self.anim, time), scene.morph_weights(self.anim, time))
-            }
+            Some(scene) => (scene.node_world_matrices(anim, time), scene.morph_weights(anim, time)),
             None => (Vec::new(), Vec::new()),
         };
         let scene_view = if let Some(r) = &mut self.renderer {
@@ -639,7 +880,7 @@ impl ApplicationHandler for App {
         let window: Arc<dyn Window> = Arc::from(event_loop.create_window(attrs).unwrap());
         self.window = Some(window);
         self.init_gpu();
-        self.start = Instant::now();
+        self.last_frame = Instant::now();
     }
 
     fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _id: WindowId, event: WindowEvent) {

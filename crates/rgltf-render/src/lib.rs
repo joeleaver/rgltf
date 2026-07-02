@@ -29,6 +29,7 @@ struct FrameUniform {
     light_color: [f32; 4],
     ambient_sky: [f32; 4],
     ambient_ground: [f32; 4],
+    flags: [f32; 4], // x = use textures (0 = material factors only)
 }
 
 #[repr(C)]
@@ -181,6 +182,8 @@ pub struct Renderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
+    /// Line-mode variant of `pipeline` (needs the `POLYGON_MODE_LINE` device feature).
+    pipeline_wire: wgpu::RenderPipeline,
     material_bgl: wgpu::BindGroupLayout,
     joint_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
@@ -195,6 +198,10 @@ pub struct Renderer {
     pub light_color: [f32; 3],
     pub ambient_sky: [f32; 3],
     pub ambient_ground: [f32; 3],
+    /// Sample material textures (false = show material factors only).
+    pub textured: bool,
+    /// Draw triangle edges instead of filled faces.
+    pub wireframe: bool,
 }
 
 impl Renderer {
@@ -335,57 +342,63 @@ impl Renderer {
             8 => Float32x4, 9 => Float32x4, 10 => Float32x4,
             13 => Uint32x4
         ];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rgltf-pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<rgltf_asset::Vertex>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &vertex_attrs,
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &instance_attrs,
-                    },
-                ],
+        let vbuffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<rgltf_asset::Vertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                // Two-sided: the shader flips the normal for back faces.
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &instance_attrs,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-            cache: None,
-        });
+        ];
+        // Fill + line (wireframe) variants of the same pipeline; the app picks per frame.
+        let make_pipeline = |polygon_mode: wgpu::PolygonMode| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rgltf-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &vbuffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Two-sided: the shader flips the normal for back faces.
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(wgpu::PolygonMode::Fill);
+        let pipeline_wire = make_pipeline(wgpu::PolygonMode::Line);
 
         let targets = Targets::new(&device, width, height);
 
@@ -393,6 +406,7 @@ impl Renderer {
             device,
             queue,
             pipeline,
+            pipeline_wire,
             material_bgl,
             joint_bgl,
             frame_uniform,
@@ -406,6 +420,8 @@ impl Renderer {
             light_color: [3.0, 3.0, 2.95],
             ambient_sky: [0.42, 0.47, 0.55],
             ambient_ground: [0.20, 0.18, 0.16],
+            textured: true,
+            wireframe: false,
         }
     }
 
@@ -648,6 +664,7 @@ impl Renderer {
             light_color: [self.light_color[0], self.light_color[1], self.light_color[2], 1.0],
             ambient_sky: [self.ambient_sky[0], self.ambient_sky[1], self.ambient_sky[2], 1.0],
             ambient_ground: [self.ambient_ground[0], self.ambient_ground[1], self.ambient_ground[2], 1.0],
+            flags: [if self.textured { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
@@ -746,7 +763,8 @@ impl Renderer {
             {
                 if !self.scene.draws.is_empty() && !self.scene.materials.is_empty() {
                     let stride = std::mem::size_of::<InstanceRaw>() as u64;
-                    pass.set_pipeline(&self.pipeline);
+                    let pipeline = if self.wireframe { &self.pipeline_wire } else { &self.pipeline };
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &self.frame_bind_group, &[]);
                     pass.set_bind_group(2, joint_bg, &[]);
                     for draw in &self.scene.draws {
