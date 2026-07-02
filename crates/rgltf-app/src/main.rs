@@ -541,12 +541,17 @@ impl App {
         }))
         .expect("no suitable GPU adapter");
 
+        // Use the adapter's full limits, not the WebGPU defaults. The default caps
+        // max_buffer_size at 256 MB, which large models exceed on a single vertex/index
+        // buffer (e.g. a multi-million-vertex rigged mesh at 72 bytes/vertex → >400 MB).
+        // The adapter's own limits are always a valid request and unlock the hardware max.
+        let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rgltf-device"),
             // BC: KTX2/Basis transcode to BC7 (see rgltf-asset). POLYGON_MODE_LINE: wireframe.
             required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
                 | wgpu::Features::POLYGON_MODE_LINE,
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             memory_hints: Default::default(),
             trace: Default::default(),
             experimental_features: Default::default(),
