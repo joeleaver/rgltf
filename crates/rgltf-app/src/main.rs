@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use rinch::embed::{
-    capture_texture_rgba, RinchContext, RinchContextConfig, RinchOverlayRenderer,
-};
+use rinch::embed::{RinchContext, RinchContextConfig, RinchOverlayRenderer};
+#[cfg(feature = "debug")]
+use rinch::embed::capture_texture_rgba;
 use rinch::platform::{MouseButton as PlatformMouseButton, PlatformEvent};
 use rinch::prelude::*;
 use rinch::wgpu;
@@ -679,6 +679,7 @@ impl App {
         self.blit_bgl = Some(blit_bgl);
 
         // Embedded rinch UI + overlay renderer.
+        #[cfg_attr(not(feature = "debug"), allow(unused_mut))]
         let mut rinch_ctx = RinchContext::new(
             RinchContextConfig {
                 width: w,
@@ -688,7 +689,10 @@ impl App {
             },
             ui,
         );
-        // Poll loop repaints every frame, so the debug-notify hook can be a no-op.
+        // The MCP debug/screenshot bridge (dev-only; gated by the `debug` cargo feature
+        // so release builds omit the listening socket). The poll loop repaints every
+        // frame, so the debug-notify hook can be a no-op.
+        #[cfg(feature = "debug")]
         let _ = rinch_ctx.attach_debug("rgltf", || {});
         let overlay = RinchOverlayRenderer::new(&device, w, h, wgpu::TextureFormat::Rgba8Unorm);
 
@@ -1003,7 +1007,9 @@ impl App {
         }
         queue.submit(std::iter::once(encoder.finish()));
 
-        // MCP debug screenshots capture the composited surface before present.
+        // MCP debug screenshots capture the composited surface before present
+        // (dev-only; gated by the `debug` cargo feature).
+        #[cfg(feature = "debug")]
         if let Some(ctx) = &mut self.rinch_ctx {
             for req in ctx.process_debug_commands() {
                 match capture_texture_rgba(&device, &queue, &frame.texture, fw, fh, self.surface_format) {
@@ -1022,9 +1028,26 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("rgltf")
             .with_surface_size(winit::dpi::LogicalSize::new(1280u32, 800));
+        // Bind the window's app id (Wayland) / WM_CLASS (X11) to `rgltf`, matching
+        // `rgltf.desktop`, so the compositor resolves the running window to the
+        // installed icon (dock / alt-tab) and groups its instances.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::{ActiveEventLoopExtWayland, WindowAttributesWayland};
+            use winit::platform::x11::{ActiveEventLoopExtX11, WindowAttributesX11};
+            if event_loop.is_wayland() {
+                attrs = attrs.with_platform_attributes(Box::new(
+                    WindowAttributesWayland::default().with_name("rgltf", "rgltf"),
+                ));
+            } else if event_loop.is_x11() {
+                attrs = attrs.with_platform_attributes(Box::new(
+                    WindowAttributesX11::default().with_name("rgltf", "rgltf"),
+                ));
+            }
+        }
         let window: Arc<dyn Window> = Arc::from(event_loop.create_window(attrs).unwrap());
         self.window = Some(window);
         self.init_gpu();

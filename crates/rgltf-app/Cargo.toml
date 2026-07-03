@@ -3,16 +3,74 @@ name = "rgltf-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "A native Linux glTF/GLB viewer that renders gltfpack-compressed models correctly."
+homepage = "https://github.com/joeleaver/rgltf"
+readme = "../../README.md"
+keywords = ["gltf", "glb", "viewer", "gltfpack", "3d"]
+categories = ["graphics", "visualization", "rendering"]
 
 [[bin]]
 name = "rgltf"
 path = "src/main.rs"
 
+# ── Debian packaging (cargo-deb) ──────────────────────────────────────────────
+# Build with `cargo deb -p rgltf-app` from the workspace root. Asset source paths
+# are relative to THIS manifest dir, hence the `../../` to reach workspace-root files.
+# The default (no-`debug`) release build is used, so the shipped binary omits the MCP
+# bridge. libvulkan is dlopen'd at runtime (not linked), so it can't be auto-detected
+# by shlibdeps — it's added to Depends explicitly.
+[package.metadata.deb]
+name = "rgltf"
+maintainer = "Joe Leaver <joe@joeleaver.com>"
+copyright = "2026 Joe Leaver"
+# Ship a hand-written machine-readable (DEP-5) copyright rather than let cargo-deb
+# synthesize one from the SPDX `license` field — that emits an uppercase-OR header and
+# only the MIT text. Our file has proper `License: MIT` + `License: Apache-2.0`
+# paragraphs (see the `copyright` asset below), so no `license-file` here.
+section = "graphics"
+priority = "optional"
+extended-description = """\
+A native, Linux-first glTF/GLB viewer that correctly renders gltfpack output — \
+EXT_meshopt_compression, KHR_mesh_quantization, KHR_texture_basisu (KTX2/Basis), and \
+EXT_mesh_gpu_instancing — on top of standard glTF 2.0 PBR with image-based lighting, \
+animation, skinning, and morph targets."""
+depends = "$auto, libvulkan1"
+recommends = "mesa-vulkan-drivers | vulkan-icd"
+assets = [
+    ["target/release/rgltf", "usr/bin/", "755"],
+    ["../../assets/linux/rgltf.desktop", "usr/share/applications/", "644"],
+    ["../../assets/linux/rgltf.xml", "usr/share/mime/packages/", "644"],
+    ["../../assets/branding/icons/16x16/rgltf.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../assets/branding/icons/24x24/rgltf.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["../../assets/branding/icons/32x32/rgltf.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../assets/branding/icons/48x48/rgltf.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../assets/branding/icons/64x64/rgltf.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../assets/branding/icons/128x128/rgltf.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../assets/branding/icons/256x256/rgltf.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../assets/branding/icons/512x512/rgltf.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["../../assets/branding/rgltf.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../assets/linux/deb/copyright", "usr/share/doc/rgltf/copyright", "644"],
+    ["../../README.md", "usr/share/doc/rgltf/README.md", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/rgltf/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/rgltf/LICENSE-APACHE", "644"],
+]
+maintainer-scripts = "../../assets/linux/deb"
+
+[features]
+# The rinch MCP debug/inspection bridge opens a listening socket for screenshots and
+# DOM inspection — invaluable in development, but it must NOT ship in a distributed
+# build. Off by default so a plain `cargo build --release` (and every packaging
+# recipe) is safe by construction; enable with `--features debug` for dev/MCP work.
+default = []
+debug = ["rinch/debug"]
+
 [dependencies]
 # We own the winit loop + wgpu device (game-embed model); rinch is an embedded UI
-# overlay via `rinch::embed`. `gpu` = the embed/Vello renderer; `debug` = the MCP
-# bridge (screenshots/inspection); `components`/`theme` for the UI.
-rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme", "debug"] }
+# overlay via `rinch::embed`. `gpu` = the embed/Vello renderer; `components`/`theme`
+# for the UI. The MCP debug bridge is behind our own default-off `debug` feature
+# (see [features]) so release builds omit the listening socket.
+rinch = { workspace = true, features = ["desktop", "gpu", "components", "theme"] }
 rgltf-render = { workspace = true }
 rgltf-asset = { workspace = true }
 rfd = { workspace = true }

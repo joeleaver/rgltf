@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=rgltf
+GenericName=glTF Viewer
+Comment=View glTF and GLB 3D models, including gltfpack-compressed files
+Exec=rgltf %f
+TryExec=rgltf
+Icon=rgltf
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;
+MimeType=model/gltf-binary;model/gltf+json;
+Keywords=glTF;GLB;3D;model;mesh;gltfpack;PBR;
+StartupNotify=true
+StartupWMClass=rgltf

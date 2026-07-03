@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  glTF MIME types for shared-mime-info. Modern desktops (shared-mime-info >= 2.0)
+  already define these; shipping them here ensures `.glb`/`.gltf` are recognised on
+  systems whose MIME database predates the glTF types, so rgltf's `.desktop` entry
+  can register as their handler. Installed to /usr/share/mime/packages/rgltf.xml and
+  merged by update-mime-database.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="model/gltf-binary">
+    <comment>glTF binary model</comment>
+    <glob pattern="*.glb"/>
+    <magic priority="50">
+      <match type="string" value="glTF" offset="0"/>
+    </magic>
+    <sub-class-of type="application/octet-stream"/>
+  </mime-type>
+  <mime-type type="model/gltf+json">
+    <comment>glTF model</comment>
+    <glob pattern="*.gltf"/>
+    <sub-class-of type="application/json"/>
+  </mime-type>
+</mime-info>
