@@ -36,7 +36,8 @@ struct FrameUniform {
     env_sky: [f32; 4],
     env_horizon: [f32; 4],
     env_ground: [f32; 4],
-    flags: [f32; 4], // x = use textures, y = prefilter mip count, z = IBL intensity
+    flags: [f32; 4],    // x = use textures, y = prefilter mip count, z = IBL intensity, w = weights view
+    viewport: [f32; 4], // x = width px, y = height px (for screen-space skeleton expansion)
 }
 
 #[repr(C)]
@@ -152,9 +153,14 @@ struct GpuScene {
     joint_bind_group: Option<wgpu::BindGroup>,
     joint_count: u32,
     /// Skeleton bone segments as `[parent_node, child_node]` pairs (joints whose parent
-    /// is also a joint). Positions are read from `node_world` each frame into `bone_buffer`.
+    /// is also a joint). World endpoints are written to `bone_inst_buffer` each frame.
     bone_lines: Vec<[usize; 2]>,
-    bone_buffer: Option<wgpu::Buffer>,
+    /// Unique joint node indices (for the joint-marker dots).
+    joint_nodes: Vec<usize>,
+    /// Per-bone instance data (start+end world) and per-joint instance data (center
+    /// world), both rewritten each frame from `node_world` (skeleton overlay).
+    bone_inst_buffer: Option<wgpu::Buffer>,
+    joint_inst_buffer: Option<wgpu::Buffer>,
 }
 
 struct Targets {
@@ -204,8 +210,11 @@ pub struct Renderer {
     pipeline_wire: wgpu::RenderPipeline,
     /// Analytic environment backdrop (drawn first, depth writes off).
     skybox_pipeline: wgpu::RenderPipeline,
-    /// Skeleton line overlay (drawn last, depth test disabled).
-    skeleton_pipeline: wgpu::RenderPipeline,
+    /// Skeleton overlay: instanced thick bone ribbons + round joint markers (depth off).
+    bone_pipeline: wgpu::RenderPipeline,
+    joint_pipeline: wgpu::RenderPipeline,
+    /// Shared unit-quad template (corners ±1) expanded per instance for the overlay.
+    quad_template: wgpu::Buffer,
     material_bgl: wgpu::BindGroupLayout,
     joint_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
@@ -484,52 +493,83 @@ impl Renderer {
             cache: None,
         });
 
-        // Skeleton overlay: world-space line segments (group 0 only), depth test off so
-        // the whole skeleton shows through the mesh.
-        let skeleton_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("rgltf-skeleton-pl"),
+        // Skeleton overlay pipelines (group 0 only; triangle-list; depth test off so the
+        // whole skeleton shows through the mesh). Instanced screen-space quads: bones are
+        // ribbons between joints, joints are round marker dots. A shared unit-quad template
+        // (corners ±1) is expanded per instance.
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgltf-overlay-pl"),
             bind_group_layouts: &[&frame_bgl],
             push_constant_ranges: &[],
         });
-        let bone_attrs = wgpu::vertex_attr_array![0 => Float32x3];
-        let skeleton_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rgltf-skeleton"),
-            layout: Some(&skeleton_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_bone"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &bone_attrs,
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_bone"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-            cache: None,
+        let quad_verts: [[f32; 2]; 6] = [
+            [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],
+            [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+        ];
+        let quad_template = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rgltf-overlay-quad"),
+            contents: bytemuck::cast_slice(&quad_verts),
+            usage: wgpu::BufferUsages::VERTEX,
         });
+        let quad_attrs = wgpu::vertex_attr_array![0 => Float32x2];
+        let bone_inst_attrs = wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32x3];
+        let joint_inst_attrs = wgpu::vertex_attr_array![1 => Float32x3];
+        let make_overlay = |vs: &str, fs: &str, buffers: &[wgpu::VertexBufferLayout]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rgltf-overlay"),
+                layout: Some(&overlay_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multiview: None,
+                cache: None,
+            })
+        };
+        let quad_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &quad_attrs,
+        };
+        let bone_buffers = [
+            quad_vbl.clone(),
+            wgpu::VertexBufferLayout {
+                array_stride: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &bone_inst_attrs,
+            },
+        ];
+        let joint_buffers = [
+            quad_vbl,
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &joint_inst_attrs,
+            },
+        ];
+        let bone_pipeline = make_overlay("vs_bone", "fs_bone", &bone_buffers);
+        let joint_pipeline = make_overlay("vs_joint", "fs_joint", &joint_buffers);
 
         // Default environment (Studio-ish); the app overrides it from the lighting preset.
         let env = EnvParams {
@@ -547,7 +587,9 @@ impl Renderer {
             pipeline,
             pipeline_wire,
             skybox_pipeline,
-            skeleton_pipeline,
+            bone_pipeline,
+            joint_pipeline,
+            quad_template,
             material_bgl,
             joint_bgl,
             frame_uniform,
@@ -827,10 +869,14 @@ impl Renderer {
         }));
         gpu.joint_buffer = Some(joint_buffer);
 
-        // Skeleton segments: one line per joint whose parent is also a joint of the same
-        // skin. Positions are written per-frame from the animated node world matrices.
+        // Skeleton overlay data: bone segments (joint→parent within a skin) + the set of
+        // unique joint nodes (marker dots). Instance buffers are written per-frame from
+        // the animated node world matrices.
         for skin in &scene.skins {
             for &j in &skin.joints {
+                if !gpu.joint_nodes.contains(&j) {
+                    gpu.joint_nodes.push(j);
+                }
                 if let Some(p) = scene.nodes.get(j).and_then(|n| n.parent) {
                     if skin.joints.contains(&p) {
                         gpu.bone_lines.push([p, j]);
@@ -839,9 +885,17 @@ impl Renderer {
             }
         }
         if !gpu.bone_lines.is_empty() {
-            gpu.bone_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rgltf-bones"),
-                size: (gpu.bone_lines.len() * 2 * std::mem::size_of::<[f32; 3]>()) as u64,
+            gpu.bone_inst_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rgltf-bone-inst"),
+                size: (gpu.bone_lines.len() * std::mem::size_of::<[f32; 6]>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if !gpu.joint_nodes.is_empty() {
+            gpu.joint_inst_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rgltf-joint-inst"),
+                size: (gpu.joint_nodes.len() * std::mem::size_of::<[f32; 3]>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
@@ -872,6 +926,7 @@ impl Renderer {
                 self.ibl_intensity,
                 if self.debug_weights { 1.0 } else { 0.0 },
             ],
+            viewport: [self.targets.width as f32, self.targets.height as f32, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
@@ -945,18 +1000,26 @@ impl Renderer {
             self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
         }
 
-        // Skeleton: current world-space endpoints of each bone segment (only rebuilt
-        // when the overlay is actually shown).
+        // Skeleton overlay: current world-space bone (start,end) instance data + joint
+        // marker positions (only rebuilt when shown).
         if self.show_skeleton {
-            if let Some(bone_buf) = &self.scene.bone_buffer {
-                let mut verts: Vec<[f32; 3]> = Vec::with_capacity(self.scene.bone_lines.len() * 2);
+            if let Some(buf) = &self.scene.bone_inst_buffer {
+                let mut inst: Vec<[f32; 6]> = Vec::with_capacity(self.scene.bone_lines.len());
                 for &[p, c] in &self.scene.bone_lines {
                     let pp = node_world.get(p).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
                     let cc = node_world.get(c).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
-                    verts.push(pp.to_array());
-                    verts.push(cc.to_array());
+                    inst.push([pp.x, pp.y, pp.z, cc.x, cc.y, cc.z]);
                 }
-                self.queue.write_buffer(bone_buf, 0, bytemuck::cast_slice(&verts));
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&inst));
+            }
+            if let Some(buf) = &self.scene.joint_inst_buffer {
+                let inst: Vec<[f32; 3]> = self
+                    .scene
+                    .joint_nodes
+                    .iter()
+                    .map(|&j| node_world.get(j).map_or(Vec3::ZERO, |m| m.w_axis.truncate()).to_array())
+                    .collect();
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&inst));
             }
         }
 
@@ -1010,13 +1073,21 @@ impl Renderer {
                 }
             }
 
-            // Skeleton overlay (depth test off → drawn on top of the mesh).
+            // Skeleton overlay (depth test off → drawn on top of the mesh): instanced
+            // thick bone ribbons, then round joint markers over the seams. The shared quad
+            // template stays bound at slot 0 across both pipelines.
             if self.show_skeleton {
-                if let Some(bone_buf) = &self.scene.bone_buffer {
-                    pass.set_pipeline(&self.skeleton_pipeline);
-                    pass.set_bind_group(0, &self.frame_bind_group, &[]);
-                    pass.set_vertex_buffer(0, bone_buf.slice(..));
-                    pass.draw(0..(self.scene.bone_lines.len() as u32 * 2), 0..1);
+                pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.quad_template.slice(..));
+                if let Some(buf) = &self.scene.bone_inst_buffer {
+                    pass.set_pipeline(&self.bone_pipeline);
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.draw(0..6, 0..self.scene.bone_lines.len() as u32);
+                }
+                if let Some(buf) = &self.scene.joint_inst_buffer {
+                    pass.set_pipeline(&self.joint_pipeline);
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.draw(0..6, 0..self.scene.joint_nodes.len() as u32);
                 }
             }
         }

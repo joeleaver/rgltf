@@ -14,7 +14,8 @@ struct Frame {
     env_sky: vec4<f32>,     // environment zenith radiance (linear)
     env_horizon: vec4<f32>, // environment horizon-band radiance
     env_ground: vec4<f32>,  // environment nadir radiance
-    flags: vec4<f32>,       // x = use material textures, y = prefilter mip count, z = IBL intensity
+    flags: vec4<f32>,       // x = use material textures, y = prefilter mip count, z = IBL intensity, w = weights view
+    viewport: vec4<f32>,    // x = width px, y = height px (screen-space skeleton expansion)
 };
 
 struct Material {
@@ -437,16 +438,75 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
 }
 
 // ── Skeleton overlay ──────────────────────────────────────────────────────────
-// Bone segments (joint→parent) as world-space lines. Positions come from a per-frame
-// vertex buffer built from the animated node world matrices (see lib.rs). Drawn with
-// depth test disabled so the whole skeleton is visible through the mesh.
+// Drawn as instanced screen-space quads (constant pixel width, always legible) with
+// depth test disabled so the whole skeleton shows through the mesh. Bones are ribbons
+// between joints; joint markers are round dots that also hide the ribbon seams. A
+// shared unit-quad template (corners ±1) is expanded per instance in screen space.
 
+const BONE_HALF_PX: f32 = 2.5;
+const JOINT_HALF_PX: f32 = 5.0;
+
+// Bone ribbon: per-instance world-space (start, end). `corner.x` picks the endpoint,
+// `corner.y` the perpendicular side; the ribbon is a constant BONE_HALF_PX half-width.
 @vertex
-fn vs_bone(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return frame.view_proj * vec4<f32>(pos, 1.0);
+fn vs_bone(
+    @location(0) corner: vec2<f32>,
+    @location(1) start: vec3<f32>,
+    @location(2) end: vec3<f32>,
+) -> @builtin(position) vec4<f32> {
+    let clip0 = frame.view_proj * vec4<f32>(start, 1.0);
+    let clip1 = frame.view_proj * vec4<f32>(end, 1.0);
+    // Cull bones crossing behind the camera (perspective divide would be garbage).
+    if (clip0.w <= 0.0 || clip1.w <= 0.0) {
+        return vec4<f32>(2.0, 2.0, 2.0, 1.0); // outside NDC → discarded
+    }
+    let along = corner.x * 0.5 + 0.5; // -1 → start, +1 → end
+    let clip = mix(clip0, clip1, along);
+
+    let half_vp = frame.viewport.xy * 0.5;
+    let s0 = clip0.xy / clip0.w * half_vp; // endpoints in pixels
+    let s1 = clip1.xy / clip1.w * half_vp;
+    var dir = s1 - s0;
+    if (length(dir) < 1e-4) { dir = vec2<f32>(1.0, 0.0); }
+    dir = normalize(dir);
+    let nrm = vec2<f32>(-dir.y, dir.x);
+
+    let offset_ndc = (nrm * corner.y * BONE_HALF_PX) / half_vp;
+    let ndc = clip.xy / clip.w + offset_ndc;
+    return vec4<f32>(ndc * clip.w, clip.z, clip.w);
 }
 
 @fragment
 fn fs_bone() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.35, 1.0, 0.55, 1.0); // bright green (offscreen sRGB space)
+    return vec4<f32>(0.25, 0.9, 0.45, 1.0); // green (offscreen sRGB space)
+}
+
+// Joint marker: a camera-facing square billboard, made round by discarding outside the
+// unit circle. Per-instance world-space center.
+struct JointOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+};
+
+@vertex
+fn vs_joint(@location(0) corner: vec2<f32>, @location(1) center: vec3<f32>) -> JointOut {
+    let clip = frame.view_proj * vec4<f32>(center, 1.0);
+    var o: JointOut;
+    o.local = corner;
+    if (clip.w <= 0.0) {
+        o.pos = vec4<f32>(2.0, 2.0, 2.0, 1.0); // behind camera → discarded
+        return o;
+    }
+    let half_vp = frame.viewport.xy * 0.5;
+    let ndc = clip.xy / clip.w + (corner * JOINT_HALF_PX) / half_vp;
+    o.pos = vec4<f32>(ndc * clip.w, clip.z, clip.w);
+    return o;
+}
+
+@fragment
+fn fs_joint(in: JointOut) -> @location(0) vec4<f32> {
+    if (dot(in.local, in.local) > 1.0) {
+        discard; // round dot
+    }
+    return vec4<f32>(0.75, 1.0, 0.55, 1.0); // brighter yellow-green
 }
