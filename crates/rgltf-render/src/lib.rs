@@ -945,16 +945,19 @@ impl Renderer {
             self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
         }
 
-        // Skeleton: current world-space endpoints of each bone segment.
-        if let Some(bone_buf) = &self.scene.bone_buffer {
-            let mut verts: Vec<[f32; 3]> = Vec::with_capacity(self.scene.bone_lines.len() * 2);
-            for &[p, c] in &self.scene.bone_lines {
-                let pp = node_world.get(p).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
-                let cc = node_world.get(c).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
-                verts.push(pp.to_array());
-                verts.push(cc.to_array());
+        // Skeleton: current world-space endpoints of each bone segment (only rebuilt
+        // when the overlay is actually shown).
+        if self.show_skeleton {
+            if let Some(bone_buf) = &self.scene.bone_buffer {
+                let mut verts: Vec<[f32; 3]> = Vec::with_capacity(self.scene.bone_lines.len() * 2);
+                for &[p, c] in &self.scene.bone_lines {
+                    let pp = node_world.get(p).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                    let cc = node_world.get(c).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                    verts.push(pp.to_array());
+                    verts.push(cc.to_array());
+                }
+                self.queue.write_buffer(bone_buf, 0, bytemuck::cast_slice(&verts));
             }
-            self.queue.write_buffer(bone_buf, 0, bytemuck::cast_slice(&verts));
         }
 
         let mut encoder = self
