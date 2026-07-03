@@ -151,6 +151,10 @@ struct GpuScene {
     joint_buffer: Option<wgpu::Buffer>,
     joint_bind_group: Option<wgpu::BindGroup>,
     joint_count: u32,
+    /// Skeleton bone segments as `[parent_node, child_node]` pairs (joints whose parent
+    /// is also a joint). Positions are read from `node_world` each frame into `bone_buffer`.
+    bone_lines: Vec<[usize; 2]>,
+    bone_buffer: Option<wgpu::Buffer>,
 }
 
 struct Targets {
@@ -200,6 +204,8 @@ pub struct Renderer {
     pipeline_wire: wgpu::RenderPipeline,
     /// Analytic environment backdrop (drawn first, depth writes off).
     skybox_pipeline: wgpu::RenderPipeline,
+    /// Skeleton line overlay (drawn last, depth test disabled).
+    skeleton_pipeline: wgpu::RenderPipeline,
     material_bgl: wgpu::BindGroupLayout,
     joint_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
@@ -224,6 +230,10 @@ pub struct Renderer {
     pub textured: bool,
     /// Draw triangle edges instead of filled faces.
     pub wireframe: bool,
+    /// Colour vertices by their bone-weight blend instead of shading them.
+    pub debug_weights: bool,
+    /// Overlay the skeleton (bone segments) on top of the scene.
+    pub show_skeleton: bool,
 }
 
 impl Renderer {
@@ -474,6 +484,53 @@ impl Renderer {
             cache: None,
         });
 
+        // Skeleton overlay: world-space line segments (group 0 only), depth test off so
+        // the whole skeleton shows through the mesh.
+        let skeleton_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgltf-skeleton-pl"),
+            bind_group_layouts: &[&frame_bgl],
+            push_constant_ranges: &[],
+        });
+        let bone_attrs = wgpu::vertex_attr_array![0 => Float32x3];
+        let skeleton_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rgltf-skeleton"),
+            layout: Some(&skeleton_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_bone"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &bone_attrs,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_bone"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
         // Default environment (Studio-ish); the app overrides it from the lighting preset.
         let env = EnvParams {
             sky: [0.42, 0.47, 0.55],
@@ -490,6 +547,7 @@ impl Renderer {
             pipeline,
             pipeline_wire,
             skybox_pipeline,
+            skeleton_pipeline,
             material_bgl,
             joint_bgl,
             frame_uniform,
@@ -508,6 +566,8 @@ impl Renderer {
             skybox: true,
             textured: true,
             wireframe: false,
+            debug_weights: false,
+            show_skeleton: false,
         }
     }
 
@@ -767,6 +827,26 @@ impl Renderer {
         }));
         gpu.joint_buffer = Some(joint_buffer);
 
+        // Skeleton segments: one line per joint whose parent is also a joint of the same
+        // skin. Positions are written per-frame from the animated node world matrices.
+        for skin in &scene.skins {
+            for &j in &skin.joints {
+                if let Some(p) = scene.nodes.get(j).and_then(|n| n.parent) {
+                    if skin.joints.contains(&p) {
+                        gpu.bone_lines.push([p, j]);
+                    }
+                }
+            }
+        }
+        if !gpu.bone_lines.is_empty() {
+            gpu.bone_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rgltf-bones"),
+                size: (gpu.bone_lines.len() * 2 * std::mem::size_of::<[f32; 3]>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
         self.scene = gpu;
     }
 
@@ -786,7 +866,12 @@ impl Renderer {
             env_sky: [self.env.sky[0], self.env.sky[1], self.env.sky[2], 1.0],
             env_horizon: [self.env.horizon[0], self.env.horizon[1], self.env.horizon[2], 1.0],
             env_ground: [self.env.ground[0], self.env.ground[1], self.env.ground[2], 1.0],
-            flags: [if self.textured { 1.0 } else { 0.0 }, PREFILTER_MIPS as f32, self.ibl_intensity, 0.0],
+            flags: [
+                if self.textured { 1.0 } else { 0.0 },
+                PREFILTER_MIPS as f32,
+                self.ibl_intensity,
+                if self.debug_weights { 1.0 } else { 0.0 },
+            ],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
@@ -860,6 +945,18 @@ impl Renderer {
             self.queue.write_buffer(inst_buf, 0, bytemuck::cast_slice(&instances));
         }
 
+        // Skeleton: current world-space endpoints of each bone segment.
+        if let Some(bone_buf) = &self.scene.bone_buffer {
+            let mut verts: Vec<[f32; 3]> = Vec::with_capacity(self.scene.bone_lines.len() * 2);
+            for &[p, c] in &self.scene.bone_lines {
+                let pp = node_world.get(p).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                let cc = node_world.get(c).map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                verts.push(pp.to_array());
+                verts.push(cc.to_array());
+            }
+            self.queue.write_buffer(bone_buf, 0, bytemuck::cast_slice(&verts));
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rgltf-enc") });
@@ -907,6 +1004,16 @@ impl Renderer {
                         pass.set_index_buffer(prim.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..prim.index_count, 0, 0..draw.instance_count);
                     }
+                }
+            }
+
+            // Skeleton overlay (depth test off → drawn on top of the mesh).
+            if self.show_skeleton {
+                if let Some(bone_buf) = &self.scene.bone_buffer {
+                    pass.set_pipeline(&self.skeleton_pipeline);
+                    pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                    pass.set_vertex_buffer(0, bone_buf.slice(..));
+                    pass.draw(0..(self.scene.bone_lines.len() as u32 * 2), 0..1);
                 }
             }
         }

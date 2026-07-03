@@ -49,6 +49,8 @@ enum RenderMode {
     Textured,
     Untextured,
     Wireframe,
+    /// Colour vertices by their bone-weight blend (skinned meshes).
+    Weights,
 }
 
 /// One selectable animation clip (index + display name).
@@ -103,6 +105,8 @@ struct UiState {
     lighting: Signal<usize>,
     /// Draw the environment skybox behind the model (else a solid clear colour).
     skybox: Signal<bool>,
+    /// Overlay the skeleton (bone segments).
+    skeleton: Signal<bool>,
     clips: Signal<Vec<ClipInfo>>,
     clip: Signal<usize>,
     playing: Signal<bool>,
@@ -179,6 +183,17 @@ fn seg_btn(active: bool) -> String {
     )
 }
 
+/// Full-width toggle button, highlighted when `active`.
+fn toggle_full(active: bool) -> String {
+    format!(
+        "width:100%; margin-top:8px; padding:7px; border-radius:6px; border:1px solid {}; \
+         background:{}; color:{}; cursor:pointer; font-size:12px;",
+        if active { "#4a7fc0" } else { "#3a3a42" },
+        if active { "#35557f" } else { "#2b2b31" },
+        if active { "#ffffff" } else { "#c2c2ca" },
+    )
+}
+
 /// Full-width play/pause button; highlighted (invites a click) while paused.
 fn play_btn(playing: bool) -> String {
     format!(
@@ -196,6 +211,7 @@ fn ui() -> NodeHandle {
     let render_mode = Signal::new(RenderMode::Textured);
     let lighting = Signal::new(0usize);
     let skybox = Signal::new(true);
+    let skeleton = Signal::new(false);
     let clips = Signal::new(Vec::<ClipInfo>::new());
     let clip = Signal::new(0usize);
     let playing = Signal::new(true);
@@ -208,6 +224,7 @@ fn ui() -> NodeHandle {
             render_mode,
             lighting,
             skybox,
+            skeleton,
             clips,
             clip,
             playing,
@@ -378,6 +395,23 @@ fn ui() -> NodeHandle {
                                 style: {move || seg_btn(!skybox.get())},
                                 "Solid"
                             }
+                        }
+                    }
+
+                    // Debug: skinning inspection (bone-weight colours + skeleton overlay).
+                    div {
+                        div { style: SECTION_LABEL, "Debug" }
+                        button {
+                            onclick: move || render_mode.update(|m| {
+                                *m = if *m == RenderMode::Weights { RenderMode::Textured } else { RenderMode::Weights };
+                            }),
+                            style: {move || toggle_full(render_mode.get() == RenderMode::Weights)},
+                            "Bone weights"
+                        }
+                        button {
+                            onclick: move || skeleton.update(|s| *s = !*s),
+                            style: {move || toggle_full(skeleton.get())},
+                            {move || if skeleton.get() { "Skeleton: on".to_string() } else { "Skeleton: off".to_string() }}
                         }
                     }
 
@@ -725,6 +759,9 @@ impl App {
     fn ui_skybox(&self) -> bool {
         UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.skybox.get())).unwrap_or(true)
     }
+    fn ui_skeleton(&self) -> bool {
+        UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.skeleton.get())).unwrap_or(false)
+    }
     fn ui_playing(&self) -> bool {
         UI_STATE.with(|s| s.borrow().as_ref().map(|u| u.playing.get())).unwrap_or(true)
     }
@@ -830,11 +867,14 @@ impl App {
         // Apply the right-panel controls to the renderer.
         let mode = self.ui_render_mode();
         let skybox_on = self.ui_skybox();
+        let skeleton_on = self.ui_skeleton();
         let preset = &LIGHT_PRESETS[self.ui_lighting().min(LIGHT_PRESETS.len() - 1)];
         if let Some(r) = &mut self.renderer {
             r.textured = mode == RenderMode::Textured;
             r.wireframe = mode == RenderMode::Wireframe;
+            r.debug_weights = mode == RenderMode::Weights;
             r.skybox = skybox_on;
+            r.show_skeleton = skeleton_on;
             r.light_dir = preset.dir;
             r.light_color = preset.color;
             r.set_environment(rgltf_render::EnvParams {

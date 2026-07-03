@@ -67,7 +67,19 @@ struct VsOut {
     @location(2) tangent: vec3<f32>,
     @location(3) bitangent: vec3<f32>,
     @location(4) uv: vec2<f32>,
+    // Bone-weight debug colour (Σ weightₖ · colour(jointₖ)); grey when un-skinned.
+    @location(5) weight_color: vec3<f32>,
 };
+
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let p = abs(fract(vec3<f32>(h) + vec3<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
+}
+
+// A distinct colour per (local) joint index, spaced by the golden ratio for good spread.
+fn joint_color(j: u32) -> vec3<f32> {
+    return hsv2rgb(fract(f32(j) * 0.6180339887), 0.65, 0.95);
+}
 
 @vertex
 fn vs_main(
@@ -116,6 +128,17 @@ fn vs_main(
     out.tangent = wt;
     out.bitangent = cross(wn, wt) * tangent.w;
     out.uv = uv;
+
+    // Bone-weight visualisation colour: blend the influencing joints' colours by weight.
+    let wsum = weights.x + weights.y + weights.z + weights.w;
+    if (skin.x == 1u && wsum > 0.001) {
+        out.weight_color = weights.x * joint_color(joints.x)
+                         + weights.y * joint_color(joints.y)
+                         + weights.z * joint_color(joints.z)
+                         + weights.w * joint_color(joints.w);
+    } else {
+        out.weight_color = vec3<f32>(0.12); // un-skinned → dark grey
+    }
     return out;
 }
 
@@ -174,6 +197,11 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    // Bone-weight debug view (flat, unlit): short-circuit before any shading.
+    if (frame.flags.w > 0.5) {
+        return vec4<f32>(to_srgb(in.weight_color), 1.0);
+    }
+
     // Global toggle: when off, ignore all material textures (show factors only).
     let use_tex = frame.flags.x > 0.5;
 
@@ -406,4 +434,19 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let world = frame.inv_view_proj * clip;
     let dir = normalize(world.xyz / world.w - frame.cam_pos.xyz);
     return vec4<f32>(to_srgb(aces(sky_gradient(dir))), 1.0);
+}
+
+// ── Skeleton overlay ──────────────────────────────────────────────────────────
+// Bone segments (joint→parent) as world-space lines. Positions come from a per-frame
+// vertex buffer built from the animated node world matrices (see lib.rs). Drawn with
+// depth test disabled so the whole skeleton is visible through the mesh.
+
+@vertex
+fn vs_bone(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return frame.view_proj * vec4<f32>(pos, 1.0);
+}
+
+@fragment
+fn fs_bone() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.35, 1.0, 0.55, 1.0); // bright green (offscreen sRGB space)
 }
