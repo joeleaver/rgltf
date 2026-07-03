@@ -33,6 +33,8 @@ gltf = { version = "1", features = [
     "KHR_materials_unlit",
     "KHR_materials_ior",
     "KHR_materials_specular",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
     "KHR_lights_punctual",
     "KHR_texture_transform",
     "KHR_materials_variants",

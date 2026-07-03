@@ -25,6 +25,25 @@ use ibl::{Ibl, IblGen, PREFILTER_MIPS};
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Fullscreen 2× downsample (bilinear from the previous mip) — builds the transmission
+/// framebuffer's blur mip chain for rough (frosted) transmission.
+const DOWNSAMPLE_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let x = f32(i32(i) / 2) * 4.0 - 1.0;
+    let y = f32(i32(i) % 2) * 4.0 - 1.0;
+    var o: VsOut;
+    o.pos = vec4<f32>(x, y, 0.0, 1.0);
+    o.uv = vec2<f32>((x + 1.0) * 0.5, 1.0 - (y + 1.0) * 0.5);
+    return o;
+}
+@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(src, samp, in.uv, 0.0);
+}
+"#;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct FrameUniform {
@@ -55,6 +74,8 @@ struct MaterialUniform {
     sheen: [f32; 4],          // sheen_color_factor rgb, w = sheen_roughness
     ext_flags: [f32; 4],      // has: specular, specular_color, clearcoat, clearcoat_roughness
     ext_flags2: [f32; 4],     // has: clearcoat_normal, sheen_color, sheen_roughness, _
+    transmission: [f32; 4],   // transmission_factor, thickness, attenuation_distance, _
+    attenuation: [f32; 4],    // attenuation_color rgb, _
 }
 
 struct GpuMaterial {
@@ -90,6 +111,9 @@ struct Draw {
     skin: Option<usize>,
     instance_base: u32,
     instance_count: u32,
+    /// Material transmits light (`KHR_materials_transmission`) → drawn in the second pass,
+    /// sampling the opaque scene copied into the transmission framebuffer.
+    transmissive: bool,
 }
 
 /// Per-instance data fed to the vertex shader: the node's model + normal matrix (used
@@ -167,12 +191,27 @@ struct Targets {
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    /// Copy of the opaque color result + a mip chain (roughness → blur) that transmissive
+    /// materials sample for the scene behind them. `transmission_view` exposes all mips.
+    #[allow(dead_code)]
+    transmission: wgpu::Texture,
+    transmission_view: wgpu::TextureView,
+    /// Per-mip (view of mip N, bind group sampling mip N-1) for the downsample chain that
+    /// fills mips 1.. after the color is copied into mip 0.
+    transmission_downsample: Vec<(wgpu::TextureView, wgpu::BindGroup)>,
+    transmission_mips: u32,
     width: u32,
     height: u32,
 }
 
 impl Targets {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        downsample_bgl: &wgpu::BindGroupLayout,
+        downsample_sampler: &wgpu::Sampler,
+    ) -> Self {
         let (width, height) = (width.max(1), height.max(1));
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rgltf-color"),
@@ -196,10 +235,77 @@ impl Targets {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
+
+        // Transmission framebuffer: full mip chain (log2(max dim) + 1 levels).
+        let transmission_mips = 32 - width.max(height).leading_zeros();
+        let transmission = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rgltf-transmission"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: transmission_mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let transmission_view = transmission.create_view(&Default::default());
+        let mip_view = |mip: u32| {
+            transmission.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("rgltf-transmission-mip"),
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        };
+        let mut transmission_downsample = Vec::new();
+        for mip in 1..transmission_mips {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rgltf-downsample-bg"),
+                layout: downsample_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&mip_view(mip - 1)) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(downsample_sampler) },
+                ],
+            });
+            transmission_downsample.push((mip_view(mip), bind_group));
+        }
+
         let color_view = color.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
-        Self { color, color_view, depth_view, width, height }
+        Self {
+            color,
+            color_view,
+            depth_view,
+            transmission,
+            transmission_view,
+            transmission_downsample,
+            transmission_mips,
+            width,
+            height,
+        }
     }
+}
+
+/// Build the group-0 bind group (frame uniform + transmission framebuffer + its sampler).
+/// Rebuilt whenever the transmission texture is recreated (on resize).
+fn make_frame_bind_group(
+    device: &wgpu::Device,
+    frame_bgl: &wgpu::BindGroupLayout,
+    frame_uniform: &wgpu::Buffer,
+    transmission_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rgltf-frame-bg"),
+        layout: frame_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: frame_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(transmission_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 
 pub struct Renderer {
@@ -217,9 +323,17 @@ pub struct Renderer {
     quad_template: wgpu::Buffer,
     material_bgl: wgpu::BindGroupLayout,
     joint_bgl: wgpu::BindGroupLayout,
+    /// Group 0 layout (frame uniform + the transmission framebuffer + its sampler). Stored
+    /// so `frame_bind_group` can be rebuilt when the transmission texture is recreated.
+    frame_bgl: wgpu::BindGroupLayout,
     frame_uniform: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    /// Transmission mip-downsample: layout + fullscreen pipeline + sampler (clamp/mip-linear),
+    /// which is also the sampler used to read the transmission framebuffer in the shader.
+    transmission_downsample_bgl: wgpu::BindGroupLayout,
+    transmission_downsample_pipeline: wgpu::RenderPipeline,
+    transmission_sampler: wgpu::Sampler,
     dummy_view: wgpu::TextureView,
     scene: GpuScene,
     targets: Targets,
@@ -255,16 +369,35 @@ impl Renderer {
         // ── Bind group layouts ──
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rgltf-frame-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // Transmission framebuffer (opaque scene behind transmissive surfaces) + sampler.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
 
         let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
@@ -335,10 +468,74 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rgltf-frame-bg"),
-            layout: &frame_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: frame_uniform.as_entire_binding() }],
+        // (frame_bind_group is built after Targets — it references the transmission view.)
+
+        // Transmission mip-downsample resources. The sampler (clamp + mip-linear) is also
+        // used to read the transmission framebuffer in the fragment shader.
+        let transmission_downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rgltf-downsample-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let transmission_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rgltf-transmission-samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let downsample_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgltf-downsample-pl"),
+            bind_group_layouts: &[&transmission_downsample_bgl],
+            push_constant_ranges: &[],
+        });
+        let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rgltf-downsample-shader"),
+            source: wgpu::ShaderSource::Wgsl(DOWNSAMPLE_WGSL.into()),
+        });
+        let transmission_downsample_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rgltf-downsample"),
+            layout: Some(&downsample_layout),
+            vertex: wgpu::VertexState {
+                module: &downsample_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &downsample_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -579,7 +776,9 @@ impl Renderer {
         };
         let ibl = ibl_gen.build(env);
 
-        let targets = Targets::new(&device, width, height);
+        let targets = Targets::new(&device, width, height, &transmission_downsample_bgl, &transmission_sampler);
+        let frame_bind_group =
+            make_frame_bind_group(&device, &frame_bgl, &frame_uniform, &targets.transmission_view, &transmission_sampler);
 
         Self {
             device,
@@ -592,9 +791,13 @@ impl Renderer {
             quad_template,
             material_bgl,
             joint_bgl,
+            frame_bgl,
             frame_uniform,
             frame_bind_group,
             sampler,
+            transmission_downsample_bgl,
+            transmission_downsample_pipeline,
+            transmission_sampler,
             dummy_view,
             scene: GpuScene::default(),
             targets,
@@ -632,7 +835,15 @@ impl Renderer {
         if width == self.targets.width && height == self.targets.height {
             return;
         }
-        self.targets = Targets::new(&self.device, width, height);
+        self.targets =
+            Targets::new(&self.device, width, height, &self.transmission_downsample_bgl, &self.transmission_sampler);
+        self.frame_bind_group = make_frame_bind_group(
+            &self.device,
+            &self.frame_bgl,
+            &self.frame_uniform,
+            &self.targets.transmission_view,
+            &self.transmission_sampler,
+        );
     }
 
     fn upload_image(&self, img: &ImageData) -> wgpu::Texture {
@@ -718,6 +929,13 @@ impl Renderer {
                 f(m.sheen_roughness_tex.is_some()),
                 0.0,
             ],
+            transmission: [
+                m.transmission_factor,
+                m.thickness_factor,
+                if m.attenuation_distance.is_finite() { m.attenuation_distance } else { 1e9 },
+                0.0,
+            ],
+            attenuation: [m.attenuation_color[0], m.attenuation_color[1], m.attenuation_color[2], 0.0],
         }
     }
 
@@ -839,7 +1057,16 @@ impl Renderer {
             for &prim in ids {
                 let count = locals.len() as u32;
                 gpu.instances_local.extend_from_slice(locals);
-                gpu.draws.push(Draw { prim, node: node_idx, skin, instance_base, instance_count: count });
+                let transmissive =
+                    scene.materials.get(gpu.prims[prim].material).is_some_and(|m| m.is_transmissive());
+                gpu.draws.push(Draw {
+                    prim,
+                    node: node_idx,
+                    skin,
+                    instance_base,
+                    instance_count: count,
+                    transmissive,
+                });
                 instance_base += count;
             }
         }
@@ -926,7 +1153,12 @@ impl Renderer {
                 self.ibl_intensity,
                 if self.debug_weights { 1.0 } else { 0.0 },
             ],
-            viewport: [self.targets.width as f32, self.targets.height as f32, 0.0, 0.0],
+            viewport: [
+                self.targets.width as f32,
+                self.targets.height as f32,
+                self.targets.transmission_mips as f32,
+                0.0,
+            ],
         };
         self.queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));
 
@@ -1023,12 +1255,15 @@ impl Renderer {
             }
         }
 
+        let has_transmissive = self.scene.draws.iter().any(|d| d.transmissive);
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rgltf-enc") });
         {
+            // Pass 1: skybox + opaque meshes (+ skeleton, unless a transmission pass follows).
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rgltf-pass"),
+                label: Some("rgltf-opaque-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.targets.color_view,
                     resolve_target: None,
@@ -1043,55 +1278,125 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // Environment backdrop (behind everything; depth writes off).
             if self.skybox {
                 pass.set_pipeline(&self.skybox_pipeline);
                 pass.set_bind_group(0, &self.frame_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            if let (Some(inst_buf), Some(joint_bg)) =
-                (&self.scene.instance_buffer, &self.scene.joint_bind_group)
-            {
-                if !self.scene.draws.is_empty() && !self.scene.materials.is_empty() {
-                    let stride = std::mem::size_of::<InstanceRaw>() as u64;
-                    let pipeline = if self.wireframe { &self.pipeline_wire } else { &self.pipeline };
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, &self.frame_bind_group, &[]);
-                    pass.set_bind_group(2, joint_bg, &[]);
-                    pass.set_bind_group(3, &self.ibl.bind_group, &[]);
-                    for draw in &self.scene.draws {
-                        let prim = &self.scene.prims[draw.prim];
-                        let mat = &self.scene.materials[prim.material];
-                        pass.set_bind_group(1, &mat.bind_group, &[]);
-                        pass.set_vertex_buffer(0, prim.vbuf.slice(..));
-                        let base = draw.instance_base as u64 * stride;
-                        let end = base + draw.instance_count as u64 * stride;
-                        pass.set_vertex_buffer(1, inst_buf.slice(base..end));
-                        pass.set_index_buffer(prim.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..prim.index_count, 0, 0..draw.instance_count);
-                    }
-                }
-            }
-
-            // Skeleton overlay (depth test off → drawn on top of the mesh): instanced
-            // thick bone ribbons, then round joint markers over the seams. The shared quad
-            // template stays bound at slot 0 across both pipelines.
-            if self.show_skeleton {
-                pass.set_bind_group(0, &self.frame_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.quad_template.slice(..));
-                if let Some(buf) = &self.scene.bone_inst_buffer {
-                    pass.set_pipeline(&self.bone_pipeline);
-                    pass.set_vertex_buffer(1, buf.slice(..));
-                    pass.draw(0..6, 0..self.scene.bone_lines.len() as u32);
-                }
-                if let Some(buf) = &self.scene.joint_inst_buffer {
-                    pass.set_pipeline(&self.joint_pipeline);
-                    pass.set_vertex_buffer(1, buf.slice(..));
-                    pass.draw(0..6, 0..self.scene.joint_nodes.len() as u32);
-                }
+            self.draw_meshes(&mut pass, false);
+            if !has_transmissive {
+                self.draw_skeleton(&mut pass);
             }
         }
+
+        // Transmission: copy the opaque result into the transmission framebuffer, build its
+        // mip chain (roughness → blur), then draw transmissive meshes sampling it (pass 2).
+        if has_transmissive {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.targets.color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.targets.transmission,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: self.targets.width, height: self.targets.height, depth_or_array_layers: 1 },
+            );
+            for (target_view, src_bg) in &self.targets.transmission_downsample {
+                let mut ds = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("rgltf-downsample"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                ds.set_pipeline(&self.transmission_downsample_pipeline);
+                ds.set_bind_group(0, src_bg, &[]);
+                ds.draw(0..3, 0..1);
+            }
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rgltf-transmission-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.draw_meshes(&mut pass, true);
+            self.draw_skeleton(&mut pass);
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Draw the scene meshes whose material transmissivity matches `transmissive` (used to
+    /// split the opaque pass from the transmission pass).
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, transmissive: bool) {
+        let (Some(inst_buf), Some(joint_bg)) =
+            (&self.scene.instance_buffer, &self.scene.joint_bind_group)
+        else {
+            return;
+        };
+        if self.scene.draws.is_empty() || self.scene.materials.is_empty() {
+            return;
+        }
+        let stride = std::mem::size_of::<InstanceRaw>() as u64;
+        let pipeline = if self.wireframe { &self.pipeline_wire } else { &self.pipeline };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(2, joint_bg, &[]);
+        pass.set_bind_group(3, &self.ibl.bind_group, &[]);
+        for draw in &self.scene.draws {
+            if draw.transmissive != transmissive {
+                continue;
+            }
+            let prim = &self.scene.prims[draw.prim];
+            let mat = &self.scene.materials[prim.material];
+            pass.set_bind_group(1, &mat.bind_group, &[]);
+            pass.set_vertex_buffer(0, prim.vbuf.slice(..));
+            let base = draw.instance_base as u64 * stride;
+            let end = base + draw.instance_count as u64 * stride;
+            pass.set_vertex_buffer(1, inst_buf.slice(base..end));
+            pass.set_index_buffer(prim.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..prim.index_count, 0, 0..draw.instance_count);
+        }
+    }
+
+    /// Draw the skeleton overlay (thick bone ribbons + joint markers) if enabled.
+    fn draw_skeleton(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if !self.show_skeleton {
+            return;
+        }
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.quad_template.slice(..));
+        if let Some(buf) = &self.scene.bone_inst_buffer {
+            pass.set_pipeline(&self.bone_pipeline);
+            pass.set_vertex_buffer(1, buf.slice(..));
+            pass.draw(0..6, 0..self.scene.bone_lines.len() as u32);
+        }
+        if let Some(buf) = &self.scene.joint_inst_buffer {
+            pass.set_pipeline(&self.joint_pipeline);
+            pass.set_vertex_buffer(1, buf.slice(..));
+            pass.draw(0..6, 0..self.scene.joint_nodes.len() as u32);
+        }
     }
 
     pub fn color_target(&self) -> (wgpu::Texture, wgpu::TextureView) {

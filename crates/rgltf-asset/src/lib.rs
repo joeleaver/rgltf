@@ -137,6 +137,22 @@ pub struct Material {
     pub sheen_roughness_factor: f32,
     pub sheen_color_tex: Option<TexRef>,     // RGB = sheen colour (sRGB)
     pub sheen_roughness_tex: Option<TexRef>, // A = sheen roughness
+    // KHR_materials_transmission — see-through surface (samples the scene behind it).
+    pub transmission_factor: f32,
+    pub transmission_tex: Option<TexRef>, // R channel
+    // KHR_materials_volume — thickness + absorption for refractive transmission.
+    pub thickness_factor: f32,
+    pub thickness_tex: Option<TexRef>, // G channel
+    pub attenuation_color: [f32; 3],
+    pub attenuation_distance: f32, // f32::INFINITY = no absorption (default)
+}
+
+impl Material {
+    /// True when the material transmits light (`KHR_materials_transmission`), so it must
+    /// be drawn in the transmission pass (sampling the opaque scene behind it).
+    pub fn is_transmissive(&self) -> bool {
+        self.transmission_factor > 0.0
+    }
 }
 
 impl Default for Material {
@@ -174,6 +190,12 @@ impl Default for Material {
             sheen_roughness_factor: 0.0,
             sheen_color_tex: None,
             sheen_roughness_tex: None,
+            transmission_factor: 0.0,
+            transmission_tex: None,
+            thickness_factor: 0.0,
+            thickness_tex: None,
+            attenuation_color: [1.0, 1.0, 1.0],
+            attenuation_distance: f32::INFINITY,
         }
     }
 }
@@ -843,6 +865,16 @@ fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
     let sheen_color_tex = sh.and_then(|v| jtex(v.get("sheenColorTexture"), img_of));
     let sheen_roughness_tex = sh.and_then(|v| jtex(v.get("sheenRoughnessTexture"), img_of));
 
+    // KHR_materials_transmission / _volume (typed accessors).
+    let trans = m.transmission();
+    let transmission_factor = trans.as_ref().map_or(0.0, |t| t.transmission_factor());
+    let transmission_tex = trans.as_ref().and_then(|t| t.transmission_texture()).map(tref);
+    let vol = m.volume();
+    let thickness_factor = vol.as_ref().map_or(0.0, |v| v.thickness_factor());
+    let thickness_tex = vol.as_ref().and_then(|v| v.thickness_texture()).map(tref);
+    let attenuation_color = vol.as_ref().map_or([1.0, 1.0, 1.0], |v| v.attenuation_color());
+    let attenuation_distance = vol.as_ref().map_or(f32::INFINITY, |v| v.attenuation_distance());
+
     Material {
         name: m.name().unwrap_or("material").to_string(),
         base_color_factor: pbr.base_color_factor(),
@@ -886,6 +918,12 @@ fn convert_material(m: gltf::Material, tex_to_image: &[usize]) -> Material {
         sheen_roughness_factor,
         sheen_color_tex,
         sheen_roughness_tex,
+        transmission_factor,
+        transmission_tex,
+        thickness_factor,
+        thickness_tex,
+        attenuation_color,
+        attenuation_distance,
     }
 }
 

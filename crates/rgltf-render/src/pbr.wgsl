@@ -31,9 +31,14 @@ struct Material {
     sheen: vec4<f32>,          // KHR_materials_sheen colour rgb, w = roughness
     ext_flags: vec4<f32>,      // has: specular, specular_color, clearcoat, clearcoat_roughness
     ext_flags2: vec4<f32>,     // has: clearcoat_normal, sheen_color, sheen_roughness, _
+    transmission: vec4<f32>,   // KHR_materials_transmission factor, thickness, attenuation distance, _
+    attenuation: vec4<f32>,    // KHR_materials_volume attenuation colour rgb, _
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
+// Opaque scene copied behind transmissive surfaces (+ mip chain for roughness blur).
+@group(0) @binding(1) var t_transmission: texture_2d<f32>;
+@group(0) @binding(2) var transmission_samp: sampler;
 
 @group(1) @binding(0) var<uniform> mat: Material;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
@@ -70,6 +75,8 @@ struct VsOut {
     @location(4) uv: vec2<f32>,
     // Bone-weight debug colour (Σ weightₖ · colour(jointₖ)); grey when un-skinned.
     @location(5) weight_color: vec3<f32>,
+    // Per-axis world scale of the model matrix (for KHR_materials_volume thickness).
+    @location(6) model_scale: vec3<f32>,
 };
 
 fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -129,6 +136,7 @@ fn vs_main(
     out.tangent = wt;
     out.bitangent = cross(wn, wt) * tangent.w;
     out.uv = uv;
+    out.model_scale = vec3<f32>(length(model[0].xyz), length(model[1].xyz), length(model[2].xyz));
 
     // Bone-weight visualisation colour: blend the influencing joints' colours by weight.
     let wsum = weights.x + weights.y + weights.z + weights.w;
@@ -194,6 +202,12 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3<f32>(0.0031308));
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3<f32>(0.0)) + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
 }
 
 @fragment
@@ -283,8 +297,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let v = normalize(frame.cam_pos.xyz - in.world_pos);
     let n_dot_v = max(dot(n, v), 1e-4);
 
+    // Diffuse and specular accumulated separately so transmission can replace the diffuse.
+    var diffuse_sum = vec3<f32>(0.0);
+    var specular_sum = vec3<f32>(0.0);
+
     // Directional key light.
-    var lo = vec3<f32>(0.0);
     {
         let l = normalize(frame.light_dir.xyz);
         let h = normalize(v + l);
@@ -298,14 +315,16 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             // KHR_materials_specular weight scales the whole dielectric specular lobe.
             let spec = d * vis * f / max(4.0 * n_dot_v * n_dot_l, 1e-5) * spec_lobe_weight;
             let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
-            lo = (kd * diffuse_color / PI + spec) * frame.light_color.rgb * n_dot_l;
+            let radiance = frame.light_color.rgb * n_dot_l;
+            diffuse_sum += kd * diffuse_color / PI * radiance;
+            specular_sum += spec * radiance;
         }
     }
 
     // Image-based lighting (split-sum): diffuse irradiance + prefiltered specular,
     // combined with the precomputed environment-BRDF LUT.
     let f_amb = f_schlick_rough(n_dot_v, f0, rough);
-    let kd = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
+    let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
     let irradiance = textureSample(irr_cube, cube_samp, n).rgb;
     let diffuse_ibl = irradiance * albedo;
     let refl = reflect(-v, n);
@@ -314,10 +333,34 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let env_brdf = textureSample(brdf_lut, lut_samp, vec2<f32>(n_dot_v, rough)).rg;
     // KHR_materials_specular weight also scales the env specular (metals keep 1).
     let specular_ibl = prefiltered * (f0 * env_brdf.x + env_brdf.y) * spec_lobe_weight;
-    let ambient = (kd * diffuse_ibl + specular_ibl) * ao * frame.flags.z;
+    diffuse_sum += kd_amb * diffuse_ibl * ao * frame.flags.z;
+    specular_sum += specular_ibl * ao * frame.flags.z;
 
-    // Base material lit result (direct key light + IBL). Sheen and clearcoat layer over it.
-    var lit = lo + ambient;
+    // ── KHR_materials_transmission (+ _volume): replace the diffuse response with the
+    // refracted scene behind the surface (sampled from the transmission framebuffer).
+    let transmission = mat.transmission.x;
+    if (transmission > 0.0) {
+        // Refract the view ray into the surface. thickness is authored in mesh-local space
+        // (KHR_materials_volume) so scale it by the node's world scale; the exit point
+        // (world_pos + ray) projects to the screen UV we read the background from, and the
+        // ray's world length is the optical path for absorption. Thickness 0 = straight through.
+        let ray = refract(-v, n, 1.0 / ior) * mat.transmission.y * in.model_scale;
+        let exit_clip = frame.view_proj * vec4<f32>(in.world_pos + ray, 1.0);
+        let refr_uv = (exit_clip.xy / exit_clip.w) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+        let t_lod = rough * max(frame.viewport.z - 1.0, 0.0); // roughness → mip (frosted)
+        var transmitted = srgb_to_linear(textureSampleLevel(t_transmission, transmission_samp, refr_uv, t_lod).rgb);
+        // Volume absorption (Beer–Lambert) over the (world-space) path length.
+        let path = length(ray);
+        if (path > 0.0) {
+            let absorb = -log(clamp(mat.attenuation.rgb, vec3<f32>(1e-4), vec3<f32>(1.0))) / max(mat.transmission.z, 1e-4);
+            transmitted = transmitted * exp(-absorb * path);
+        }
+        transmitted = transmitted * albedo; // tint by the base colour
+        diffuse_sum = mix(diffuse_sum, transmitted, transmission);
+    }
+
+    // Base material lit result. Sheen and clearcoat layer over it.
+    var lit = diffuse_sum + specular_sum;
 
     // ── KHR_materials_sheen: a retroreflective cloth lobe added over the base. Gated on
     // the (uniform) sheen colour/flag so textureSample stays in uniform control flow.
