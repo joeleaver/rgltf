@@ -416,7 +416,7 @@ fn ui() -> NodeHandle {
                     }
 
                     div { style: "margin-top:auto; color:#6f6f78; font-size:12px; line-height:1.7;",
-                        "Drag to orbit · Scroll to zoom · Drop a glTF to open" }
+                        "Drag to orbit · Middle-drag to pan · Scroll to zoom · Drop a glTF to open" }
                 }
             }
 
@@ -499,6 +499,7 @@ struct App {
     last_frame: Instant,
 
     dragging: bool,
+    panning: bool,
     mouse_phys: (f32, f32),
     pending_events: Vec<PlatformEvent>,
 }
@@ -524,6 +525,7 @@ impl App {
             anim_time: 0.0,
             last_frame: Instant::now(),
             dragging: false,
+            panning: false,
             mouse_phys: (0.0, 0.0),
             pending_events: Vec::new(),
         }
@@ -1076,9 +1078,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::PointerMoved { position, .. } => {
                 let (px, py) = (position.x as f32, position.y as f32);
-                if self.dragging {
+                if self.dragging || self.panning {
                     let (dx, dy) = (px - self.mouse_phys.0, py - self.mouse_phys.1);
-                    self.camera.orbit(dx, dy);
+                    if self.panning {
+                        let (_, _, _, vh) = self.viewport_px();
+                        self.camera.pan(dx, dy, vh as f32);
+                    } else {
+                        self.camera.orbit(dx, dy);
+                    }
                 }
                 self.mouse_phys = (px, py);
                 self.pending_events.push(PlatformEvent::MouseMove { x: px, y: py });
@@ -1099,11 +1106,15 @@ impl ApplicationHandler for App {
                             self.pending_events.push(PlatformEvent::MouseDown { x: px, y: py, button: btn });
                         } else if btn == PlatformMouseButton::Left {
                             self.dragging = true;
+                        } else if btn == PlatformMouseButton::Middle {
+                            self.panning = true;
                         }
                     }
                     ElementState::Released => {
                         if self.dragging && btn == PlatformMouseButton::Left {
                             self.dragging = false;
+                        } else if self.panning && btn == PlatformMouseButton::Middle {
+                            self.panning = false;
                         } else {
                             self.pending_events.push(PlatformEvent::MouseUp { x: px, y: py, button: btn });
                         }

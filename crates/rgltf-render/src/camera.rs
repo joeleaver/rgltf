@@ -13,6 +13,9 @@ pub struct Camera {
     pub distance: f32,
     /// Look-at target in world space.
     pub target: Vec3,
+    /// Center of the framed content; `refit` restores the target here so
+    /// "reset" also undoes any panning.
+    pub center: Vec3,
     /// Vertical field of view (radians).
     pub fovy: f32,
     /// Viewport aspect ratio (width / height).
@@ -29,6 +32,7 @@ impl Camera {
             pitch: 0.45,
             distance: 3.5,
             target: Vec3::ZERO,
+            center: Vec3::ZERO,
             fovy: 45f32.to_radians(),
             aspect: if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 },
             radius: 1.0,
@@ -80,6 +84,17 @@ impl Camera {
         self.pitch = (self.pitch + dy * SENS).clamp(-1.5, 1.5);
     }
 
+    /// Pan by pixel deltas: slide the target along the view plane so content at
+    /// the target depth follows the cursor 1:1. `viewport_h` is the viewport
+    /// height in the same pixel units as `dx`/`dy`.
+    pub fn pan(&mut self, dx: f32, dy: f32, viewport_h: f32) {
+        let world_per_px = 2.0 * self.distance * (self.fovy * 0.5).tan() / viewport_h.max(1.0);
+        let forward = (self.target - self.eye()) / self.distance.max(1e-6);
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward);
+        self.target += (up * dy - right * dx) * world_per_px;
+    }
+
     /// Dolly toward/away from the target. `delta` is wheel delta_y; scrolling up
     /// (wheel forward) zooms in, matching common convention.
     pub fn zoom(&mut self, delta: f32) {
@@ -93,6 +108,7 @@ impl Camera {
     pub fn frame(&mut self, center: Vec3, radius: f32) {
         let radius = radius.max(1e-4);
         self.target = center;
+        self.center = center;
         self.radius = radius;
         self.yaw = 0.7;
         self.pitch = 0.45;
@@ -122,7 +138,51 @@ impl Camera {
     }
 
     /// Restore the default 3/4 framing of the current content (the "reset" button).
+    /// Also re-centers the target, undoing any panning.
     pub fn refit(&mut self) {
+        self.target = self.center;
         self.set_view(0.7, 0.45);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Project a world point to viewport pixels (y down) for a `w`×`h` viewport.
+    fn to_px(cam: &Camera, p: Vec3, w: f32, h: f32) -> (f32, f32) {
+        let clip = cam.view_proj() * p.extend(1.0);
+        let ndc = clip / clip.w;
+        ((ndc.x * 0.5 + 0.5) * w, (0.5 - ndc.y * 0.5) * h)
+    }
+
+    /// Panning by (dx, dy) pixels must move content at the target depth by
+    /// exactly (dx, dy) pixels on screen — the scene follows the cursor 1:1.
+    #[test]
+    fn pan_tracks_cursor_at_target_depth() {
+        let (w, h) = (1600.0, 900.0);
+        let mut cam = Camera::new(w / h);
+        cam.frame(Vec3::new(0.3, -0.2, 0.5), 2.0);
+        let anchor = cam.target;
+        let before = to_px(&cam, anchor, w, h);
+
+        let (dx, dy) = (137.0, -83.0);
+        cam.pan(dx, dy, h);
+        let after = to_px(&cam, anchor, w, h);
+
+        assert!((after.0 - before.0 - dx).abs() < 1e-2, "x: {before:?} -> {after:?}");
+        assert!((after.1 - before.1 - dy).abs() < 1e-2, "y: {before:?} -> {after:?}");
+    }
+
+    /// The reset button (refit) must undo panning, restoring the framed center.
+    #[test]
+    fn refit_undoes_pan() {
+        let mut cam = Camera::new(16.0 / 9.0);
+        let center = Vec3::new(1.0, 2.0, 3.0);
+        cam.frame(center, 1.5);
+        cam.pan(200.0, -120.0, 900.0);
+        assert!(cam.target.distance(center) > 0.0);
+        cam.refit();
+        assert_eq!(cam.target, center);
     }
 }

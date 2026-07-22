@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "rgltf-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pollster",
  "rfd",
@@ -3309,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "rgltf-asset"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "rgltf-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam",

@@ -79,7 +79,7 @@ To build the distributable packages: `cargo deb -p rgltf-app` produces the `.deb
 cargo run -p rgltf-app -- path/to/model.glb
 ```
 
-Or start it with no argument and use **Open glTF…**. Drag to orbit, scroll to zoom.
+Or start it with no argument and use **Open glTF…**. Drag to orbit, middle-drag to pan, scroll to zoom.
 
 To produce a gltfpack-compressed file to try it on:
 
